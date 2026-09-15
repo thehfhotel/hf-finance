@@ -421,6 +421,7 @@ jobs:
           # own Access session.
           CF_SHARE_CLIENT_ID: ${{ secrets.CF_SHARE_CLIENT_ID }}
           CF_SHARE_CLIENT_SECRET: ${{ secrets.CF_SHARE_CLIENT_SECRET }}
+          LEDGER_FEED_TOKEN: ${{ secrets.LEDGER_FEED_TOKEN }}
           IMAGE_TAG: sha-${{ github.sha }}
         run: |
           set -euo pipefail
@@ -480,6 +481,7 @@ jobs:
           # Optional and both-or-neither; unset leaves iOS setup manual.
           CF_SHARE_CLIENT_ID=${CF_SHARE_CLIENT_ID}
           CF_SHARE_CLIENT_SECRET=${CF_SHARE_CLIENT_SECRET}
+          LEDGER_FEED_TOKEN=${LEDGER_FEED_TOKEN}
           EOF
 
       - name: Log in to GHCR (on remote host)

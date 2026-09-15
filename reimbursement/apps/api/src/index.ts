@@ -13,6 +13,7 @@ import { authCfRoutes, hasValidCfIdentity } from './routes/auth_cf';
 import { authCardRoutes } from './routes/auth_card';
 import { adminRoutes } from './routes/admin';
 import { startKbizPoller } from './kbiz-poller';
+import { ledgerFeedRoutes } from './routes/ledger-feed';
 
 const PORT = Number(process.env.API_PORT ?? 3001);
 const UPLOADS_DIR = resolve(process.cwd(), 'uploads');
@@ -153,6 +154,7 @@ const app = new Elysia()
   .group('/api', (api) =>
     api
       .use(meRoutes)
+      .use(ledgerFeedRoutes)
       .use(receiptRoutes)
       .use(inboxRoutes)
       // The two phone-facing producers carry their OWN authentication —

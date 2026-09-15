@@ -122,6 +122,8 @@ services:
       # and changes nothing else. Android never needs these.
       CF_SHARE_CLIENT_ID: ${CF_SHARE_CLIENT_ID:-}
       CF_SHARE_CLIENT_SECRET: ${CF_SHARE_CLIENT_SECRET:-}
+      # Read-only submitted-receipt feed for the expense ledger. Empty = closed.
+      LEDGER_FEED_TOKEN: ${LEDGER_FEED_TOKEN:-}
     volumes:
       # Persistent storage for receipt photos and transfer screenshots.
       # Mount path matches the apps/api/uploads directory inside the image.

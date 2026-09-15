@@ -8,6 +8,29 @@ usable via NFC staff-card tap) — then a silent token exchange.
 Reimbursement only — company accounting (daily income + expenses, P&L) lives
 in a separate app, income.thehfhotel.org.
 
+## Expense-ledger feed
+
+The expense ledger reads `GET /api/ledger-feed/receipts?since=<UTC ISO instant>`
+every 30 seconds with `Authorization: Bearer <LEDGER_FEED_TOKEN>`. The token is
+a dedicated GitHub secret carried through the existing reimbursement deployment
+workflow and compose environment; empty means all feed routes reject requests.
+This credential never grants a session or permission to pay/edit a request.
+
+Version 1 returns `{version, complete, since, generatedAt, items}` as one complete
+snapshot (fails closed above 5,000 receipts). It includes receipts on submitted
+requests in PENDING/APPROVED/PAYING/PAID, from the fixed activation time onward.
+Unsent receipts and rejected requests are excluded. Every item carries receipt
+and request IDs, integer satang, original category/property/purchase date,
+claimant/merchant/note, submission time, status, paid time, a check that the
+request payment equals its receipts, and attachment count. No bank-account data,
+transfer-slip images, session credentials, or user directory are exported.
+
+`GET /api/ledger-feed/receipts/:id/photos/:index` uses the same credential and
+only serves attachments on active submitted receipts. The ledger's own protected
+photo route proxies these images. All source routes are read-only: paying still
+happens through the existing approved manual/KBIZ workflow. CI runs the feed's
+database integration tests alongside the existing deployment gate.
+
 ## Stack
 
 Bun · Elysia · Prisma · Postgres · Vite · React · TypeScript · Cloudflare
