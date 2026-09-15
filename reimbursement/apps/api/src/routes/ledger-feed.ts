@@ -27,7 +27,7 @@ export const ledgerFeedRoutes = new Elysia({ prefix: '/ledger-feed' })
     const items = receipts.map(r => {
       const b = r.bundle!;
       return {
-        id: r.id, bundleId: b.id, status: b.status, submittedAt: b.submittedAt.toISOString(),
+        id: r.id, bundleId: b.id, requestName: b.name, status: b.status, submittedAt: b.submittedAt.toISOString(),
         paidAt: b.paidAt?.toISOString() ?? null,
         paymentMatchesReceipts: b.status !== 'PAID' || (b.transferAmount !== null
           && ledgerSatang(b.transferAmount) === b.receipts.reduce((n, x) => n + ledgerSatang(x.amount), 0)),
