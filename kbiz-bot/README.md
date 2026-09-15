@@ -246,8 +246,14 @@ and matching `executeDate` and `transactionStatusDate`. Both bank timestamps are
 parsed as Bangkok time; the execution date becomes the ledger payment date.
 Full recipient details stay in bot memory and are never published.
 
-New runs use the captured bank reference. Older runs lacking a reference need
-one unique matching bank batch and one unique local run. A reference already
+New runs use the captured bank reference. Older runs lacking a reference can
+match the bank's exact uploaded filename to the request's generated `${id}.xlsx`.
+This disambiguates retry attempts while retaining every recipient/payment check.
+Filename ownership must be unique across the queue and archive; duplicate bank
+uploads of that filename remain ambiguous. There is no case, prefix, path, or
+partial filename matching. A supplied mismatching filename cannot fall back to
+matching amounts. If the bank omits its filename, the older exact-data fallback
+still needs one unique matching bank batch and one unique local run. A reference already
 claimed anywhere in the queue or archive cannot settle another run. Missing,
 partial, ambiguous, changed, or unavailable bank results remain unpaid and show
 an unresolved status. There is no automatic retry of a transfer and no manual

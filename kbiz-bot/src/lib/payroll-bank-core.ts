@@ -16,6 +16,7 @@ export type PayrollVerification = {
 };
 export type PayrollBankBatch = {
   referenceNo: string;
+  uploadFileName: string | null;
   status: string;
   approveStatus: string;
   createdAt: string;
@@ -77,7 +78,8 @@ export function parsePayrollBankBatch(value: unknown): PayrollBankBatch {
     r.transactionType !== "PYRL" ||
     !payrollBankReference(r.reqRefNo) ||
     typeof r.tranStatus !== "string" ||
-    typeof r.approveStatus !== "string"
+    typeof r.approveStatus !== "string" ||
+    (r.attachFileName != null && typeof r.attachFileName !== "string")
   )
     throw Error("BANK_BATCH_INVALID");
   const createdAt = bankInstant(r.createDate),
@@ -85,6 +87,9 @@ export function parsePayrollBankBatch(value: unknown): PayrollBankBatch {
   if (!createdAt || !effective) throw Error("BANK_DATE_INVALID");
   return {
     referenceNo: r.reqRefNo,
+    // Keep the bank's exact filename. Never normalize, truncate, or fuzzy-match it.
+    uploadFileName:
+      typeof r.attachFileName === "string" ? r.attachFileName : null,
     status: r.tranStatus,
     approveStatus: r.approveStatus,
     createdAt,
@@ -151,6 +156,28 @@ function bankMatches(
   }));
   return signature({ ...t, rows }) === signature(t);
 }
+function payrollWorkbookBasename(request: unknown): string | null {
+  const r = payrollObject(request);
+  if (r?.type !== "transfer-payroll" || typeof r.xlsxPath !== "string")
+    return null;
+  const name = r.xlsxPath.split("/").pop();
+  return name && /^[A-Za-z0-9_-]{1,100}\.xlsx$/.test(name) ? name : null;
+}
+/** submitRequest writes one generated workbook per immutable request id. */
+function generatedUploadFileName(request: unknown): string | null {
+  const r = payrollObject(request);
+  if (
+    !r ||
+    r.type !== "transfer-payroll" ||
+    typeof r.id !== "string" ||
+    !/^[A-Za-z0-9_-]{1,100}$/.test(r.id) ||
+    typeof r.xlsxPath !== "string"
+  )
+    return null;
+  const expected = `${r.id}.xlsx`;
+  return payrollWorkbookBasename(r) === expected ? expected : null;
+}
+
 /** All queue/archive items are required, so a bank batch can settle only one local run. */
 export function decidePayrollBankVerification(
   request: unknown,
@@ -177,17 +204,45 @@ export function decidePayrollBankVerification(
     : null;
   if (transfer.effectiveDate > bangkokPayrollDate(now))
     return decision("SCHEDULED", "FUTURE_PAY_DATE");
-  const candidates = batches.filter((b) =>
+  const expectedFileName = generatedUploadFileName(request);
+  const belongsToOtherRequest = (bank: PayrollBankBatch): boolean =>
+    bank.uploadFileName !== null &&
+    allRequests.some((other) => {
+      const r = payrollObject(other);
+      return (
+        r?.id !== transfer.id &&
+        payrollWorkbookBasename(other) === bank.uploadFileName
+      );
+    });
+  const matching = batches.filter((bank) =>
     captured
-      ? b.referenceNo === captured
-      : bankMatches(transfer, b) && b.createdAt >= transfer.submittedAt,
+      ? bank.referenceNo === captured
+      : bankMatches(transfer, bank) && bank.createdAt >= transfer.submittedAt,
   );
+  // A captured bank reference remains the first choice. Without one, the exact
+  // generated upload filename can distinguish retries with identical payroll.
+  // Select exact file identities before checking amounts, so contradictory or
+  // duplicate named batches cannot disappear into the legacy fallback.
+  // That fallback is available only when the bank omits its filename.
+  const sameUpload =
+    captured || expectedFileName === null
+      ? []
+      : batches.filter((bank) => bank.uploadFileName === expectedFileName);
+  const candidates = captured
+    ? matching
+    : sameUpload.length
+      ? sameUpload
+      : matching.filter((bank) => bank.uploadFileName === null);
   if (candidates.length !== 1)
     return decision(
       "UNKNOWN",
       candidates.length ? "AMBIGUOUS_BANK_BATCH" : "BANK_BATCH_NOT_FOUND",
     );
   const bank = candidates[0];
+  if (belongsToOtherRequest(bank))
+    return decision("UNKNOWN", "BANK_UPLOAD_BELONGS_TO_OTHER_REQUEST");
+  const boundByFileName =
+    expectedFileName !== null && bank.uploadFileName === expectedFileName;
   for (const other of allRequests) {
     const r = payrollObject(other);
     if (!r || r.id === transfer.id || r.type !== "transfer-payroll") continue;
@@ -200,7 +255,11 @@ export function decidePayrollBankVerification(
         .toUpperCase() === bank.referenceNo
     )
       return decision("UNKNOWN", "BANK_REFERENCE_ALREADY_CLAIMED");
-    if (!captured && !["rejected", "pending"].includes(String(r.status))) {
+    if (
+      !captured &&
+      !boundByFileName &&
+      !["rejected", "pending"].includes(String(r.status))
+    ) {
       try {
         if (signature(validatePayrollTransfer(other)) === signature(transfer))
           return decision("UNKNOWN", "AMBIGUOUS_LOCAL_RUN");

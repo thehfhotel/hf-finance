@@ -13,6 +13,7 @@ function request(id = "sample_run") {
   return {
     id,
     type: "transfer-payroll",
+    xlsxPath: `data/queue/${id}.xlsx`,
     createdAt: "2026-09-01T08:00:00.000Z",
     status: "done",
     result: { success: true, bankReferenceNo: ref },
@@ -31,6 +32,7 @@ function request(id = "sample_run") {
 function batch(): PayrollBankBatch {
   return {
     referenceNo: ref,
+    uploadFileName: null,
     status: "Success",
     approveStatus: "AP",
     createdAt: "2026-09-01T08:01:00.000Z",
@@ -134,6 +136,176 @@ describe("bank payroll proof", () => {
     expect(check(batch(), r, [other]).payrollVerification.reasonCode).toBe(
       "AMBIGUOUS_LOCAL_RUN",
     );
+  });
+  test("exact generated bank upload filename settles only the matching historical retry", () => {
+    const original = {
+      ...request("first_attempt"),
+      status: "failed",
+      result: { success: false },
+    };
+    const retry = { ...request("retry_attempt"), result: { success: true } };
+    const bank = { ...batch(), uploadFileName: "retry_attempt.xlsx" };
+    expect(check(bank, retry, [original]).payrollSettlement?.status).toBe(
+      "PAID",
+    );
+    expect(check(bank, original, [retry]).payrollSettlement).toBeUndefined();
+    // Swapping the source filename reverses the binding, not the transfer data.
+    const firstBank = { ...bank, uploadFileName: "first_attempt.xlsx" };
+    expect(check(firstBank, original, [retry]).payrollSettlement?.status).toBe(
+      "PAID",
+    );
+    expect(
+      check(firstBank, retry, [original]).payrollSettlement,
+    ).toBeUndefined();
+  });
+  test("missing, generic, mismatched, partial or case-normalized filenames cannot disambiguate retries", () => {
+    const original = { ...request("first_attempt"), result: { success: true } };
+    const retry = { ...request("retry_attempt"), result: { success: true } };
+    for (const uploadFileName of [
+      null,
+      "payroll.xlsx",
+      "unrelated.xlsx",
+      "prefix_retry_attempt.xlsx",
+      "retry_attempt.xlsx.bak",
+      "RETRY_ATTEMPT.xlsx",
+      " retry_attempt.xlsx ",
+      "path/retry_attempt.xlsx",
+    ]) {
+      expect(
+        check({ ...batch(), uploadFileName }, retry, [original])
+          .payrollSettlement,
+      ).toBeUndefined();
+    }
+  });
+  test("bank filename binding requires the source's generated workbook basename", () => {
+    const original = { ...request("first_attempt"), result: { success: true } };
+    const retry = {
+      ...request("retry_attempt"),
+      result: { success: true },
+      xlsxPath: "data/queue/payroll.xlsx",
+    };
+    expect(
+      check({ ...batch(), uploadFileName: "retry_attempt.xlsx" }, retry, [
+        original,
+      ]).payrollSettlement,
+    ).toBeUndefined();
+  });
+  test("a supplied mismatching filename is not ignored even for a unique source run", () => {
+    const r = { ...request(), result: { success: true } };
+    expect(
+      check({ ...batch(), uploadFileName: "generic-payroll.xlsx" }, r)
+        .payrollSettlement,
+    ).toBeUndefined();
+  });
+  test("another local record pointing to the same workbook prevents filename ownership", () => {
+    const r = { ...request(), result: { success: true } };
+    const other = {
+      ...request("other"),
+      result: { success: true },
+      xlsxPath: "data/queue/sample_run.xlsx",
+    };
+    expect(
+      check({ ...batch(), uploadFileName: "sample_run.xlsx" }, r, [other])
+        .payrollVerification.reasonCode,
+    ).toBe("BANK_UPLOAD_BELONGS_TO_OTHER_REQUEST");
+  });
+  test("exact file identity with wrong financial data cannot fall back to an unnamed batch", () => {
+    const r = { ...request(), result: { success: true } };
+    const named = {
+      ...batch(),
+      amountSatang: 1,
+      uploadFileName: "sample_run.xlsx",
+    };
+    const unnamed = { ...batch(), referenceNo: "PYRL000000000000002" };
+    expect(
+      decidePayrollBankVerification(r, [named, unnamed], [r], now)
+        .payrollVerification.reasonCode,
+    ).toBe("BANK_RECIPIENT_MISMATCH");
+  });
+  test("duplicate exact file identities remain ambiguous even when one has wrong financial data", () => {
+    const r = { ...request(), result: { success: true } };
+    const named = { ...batch(), uploadFileName: "sample_run.xlsx" };
+    const wrong = {
+      ...named,
+      referenceNo: "PYRL000000000000002",
+      amountSatang: 1,
+    };
+    expect(
+      decidePayrollBankVerification(r, [named, wrong], [r], now)
+        .payrollVerification.reasonCode,
+    ).toBe("AMBIGUOUS_BANK_BATCH");
+  });
+  test("known bank upload for another run is excluded even when the requesting run is otherwise unique", () => {
+    const wrong = { ...request("other_run"), result: { success: true } };
+    const owner = {
+      ...request("owner_run"),
+      status: "rejected",
+      result: { success: false },
+    };
+    expect(
+      check({ ...batch(), uploadFileName: "owner_run.xlsx" }, wrong, [owner])
+        .payrollSettlement,
+    ).toBeUndefined();
+  });
+  test("exact filenames do not override a globally claimed bank reference", () => {
+    const retry = { ...request("retry_attempt"), result: { success: true } };
+    const claimed = {
+      ...request("older"),
+      payrollSettlement: { referenceNo: ref },
+    };
+    expect(
+      check({ ...batch(), uploadFileName: "retry_attempt.xlsx" }, retry, [
+        claimed,
+      ]).payrollVerification.reasonCode,
+    ).toBe("BANK_REFERENCE_ALREADY_CLAIMED");
+  });
+  test("filename-bound payroll still requires full recipients, dates and every successful outcome", () => {
+    const original = { ...request("first_attempt"), result: { success: true } };
+    const retry = { ...request("retry_attempt"), result: { success: true } };
+    for (const bad of [
+      { failedCount: 1 },
+      { status: "Scheduled" },
+      { amountSatang: 1 },
+      { effectiveDate: "2026-09-14" },
+      { recipients: batch().recipients!.slice(1) },
+    ]) {
+      expect(
+        check(
+          { ...batch(), uploadFileName: "retry_attempt.xlsx", ...bad },
+          retry,
+          [original],
+        ).payrollSettlement,
+      ).toBeUndefined();
+    }
+  });
+  test("captured reference is preferred to filenames and contradictory known ownership stays unresolved", () => {
+    const exact = {
+      ...batch(),
+      referenceNo: "PYRL000000000000002",
+      uploadFileName: "sample_run.xlsx",
+    };
+    expect(
+      decidePayrollBankVerification(request(), [exact], [request()], now)
+        .payrollSettlement,
+    ).toBeUndefined();
+    const wrongOwner = { ...request("other"), result: { success: true } };
+    expect(
+      check({ ...batch(), uploadFileName: "other.xlsx" }, request(), [
+        wrongOwner,
+      ]).payrollVerification.reasonCode,
+    ).toBe("BANK_UPLOAD_BELONGS_TO_OTHER_REQUEST");
+  });
+  test("two bank uploads with the same exact generated filename are still ambiguous", () => {
+    const r = { ...request(), result: { success: true } };
+    const b = { ...batch(), uploadFileName: "sample_run.xlsx" };
+    expect(
+      decidePayrollBankVerification(
+        r,
+        [b, { ...b, referenceNo: "PYRL000000000000002" }],
+        [r],
+        now,
+      ).payrollVerification.reasonCode,
+    ).toBe("AMBIGUOUS_BANK_BATCH");
   });
   test("known reference matches only the exact bank batch", () => {
     expect(
@@ -240,6 +412,14 @@ describe("observed bank schema", () => {
       totalFail: 0,
     };
     expect(parsePayrollBankBatch(raw).amountSatang).toBe(30000);
+    expect(
+      parsePayrollBankBatch({ ...raw, attachFileName: "sample_run.xlsx" })
+        .uploadFileName,
+    ).toBe("sample_run.xlsx");
+    expect(parsePayrollBankBatch(raw).uploadFileName).toBeNull();
+    expect(() =>
+      parsePayrollBankBatch({ ...raw, attachFileName: 123 }),
+    ).toThrow("BANK_BATCH_INVALID");
     expect(() =>
       parsePayrollBankBatch({ ...raw, totalSuccess: "2" }),
     ).toThrow();

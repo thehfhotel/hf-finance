@@ -170,7 +170,11 @@ strict. No live-KBIZ test runs without the operator watching.
 
 - `done` payroll is submitted, never automatically paid. The post-phone-approval
   `getTransactionSuccessPayroll` response supplies `result.bankReferenceNo` for
-  later matching. Only the history verifier writes `payrollSettlement` proof.
+  later matching. Legacy retries may use bank `attachFileName` ONLY when it
+  exactly equals the source's generated `${id}.xlsx`, with unique local workbook
+  ownership and bank batch. Missing filenames retain unique exact-data fallback;
+  supplied mismatching filenames never do. Only the history verifier writes
+  `payrollSettlement` proof.
 - `PAYROLL_BANK_VERIFY_SINCE` enables verification of recent submitted runs; it is
   independent of the ledger's new-submission-only cutoff.
 - Live read-only verified: `/menu/account/account/history`, dropdown `#tranType`
