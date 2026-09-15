@@ -48,6 +48,8 @@ COPY reimbursement/packages/shared /app/reimbursement/packages/shared
 RUN mkdir -p node_modules/@reimbursement \
   && ln -sfn /app/reimbursement/packages/shared node_modules/@reimbursement/shared
 
+COPY src/payroll-settlement.ts /app/src/payroll-settlement.ts
+
 COPY kbiz-bot/src ./src
 
 ENV KBIZ_HEADLESS=1

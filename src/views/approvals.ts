@@ -215,6 +215,23 @@ const STATUS_LABELS = {
   rejected: "ปฏิเสธ", running: "กำลังประมวลผล",
   done: "สำเร็จ", failed: "ไม่สำเร็จ",
 };
+function statusLabel(req) {
+  if (req.type === "transfer-payroll") {
+    if (req.payrollPaidDate) return "จ่ายแล้ว · ธนาคารยืนยัน";
+    if (req.payrollVerificationStatus === "FAILED") return "โอนไม่สำเร็จ";
+    if (req.payrollVerificationStatus === "UNKNOWN") return "รอตรวจสอบผลโอน";
+    if (req.status === "done") return "ส่งธนาคารแล้ว · รอผลโอน";
+  }
+  return STATUS_LABELS[req.status] || req.status;
+}
+function statusTone(req) {
+  if (req.type === "transfer-payroll") {
+    if (req.payrollPaidDate) return "done";
+    if (req.payrollVerificationStatus === "FAILED") return "failed";
+    if (req.status === "done") return "approved";
+  }
+  return req.status;
+}
 const STATE_HINTS = {
   pending: "รอ admin อนุมัติ — กดปุ่มอนุมัติเพื่อขอ OTP",
   approved: "อนุมัติแล้ว · รอ kbiz-bot รับงาน",
@@ -292,7 +309,7 @@ function figuresFor(req) {
   if (req.type === "transfer-payroll") {
     bits.push(\`\${req.summary.rows.length} คน\`);
     bits.push(\`<span class="amount">฿\${fmtAmount(req.summary.totalAmount)}</span>\`);
-    if (req.summary.effectiveDate) bits.push(\`เงินเข้า \${escapeHtml(req.summary.effectiveDate)}\`);
+    if (req.summary.effectiveDate) bits.push(\`กำหนดโอน \${escapeHtml(req.summary.effectiveDate)}\`);
   } else if (req.type === "add-payroll") {
     bits.push(\`\${req.summary.accounts.length} บัญชี\`);
   }
@@ -337,7 +354,7 @@ function renderPendingCard(req) {
 
   return \`<div class="pcard s-\${status}">
     <div class="pcard-row1">
-      <span class="pill p-\${status}">\${STATUS_LABELS[status] || status}</span>
+      <span class="pill p-\${status}">\${escapeHtml(statusLabel(req))}</span>
       <span class="ago">\${relativeTime(effectiveTime(req))}</span>
     </div>
     <div class="pcard-headline">\${escapeHtml(headlineFor(req))}</div>
@@ -365,8 +382,8 @@ function renderHistoryRow(req) {
   const snapLink = req.type === "transfer-payroll"
     ? \`<a href="/worksheet?snapshot=\${encodeURIComponent(req.id)}">รายละเอียด</a>\`
     : "";
-  return \`<div class="row s-\${req.status}" title="\${escapeHtml(req.id)}">
-    <span class="pill p-\${req.status}">\${STATUS_LABELS[req.status] || req.status}</span>
+  return \`<div class="row s-\${statusTone(req)}" title="\${escapeHtml(req.id)}">
+    <span class="pill p-\${statusTone(req)}">\${escapeHtml(statusLabel(req))}</span>
     <span class="when">\${shortWhen(effectiveTime(req))}</span>
     <span class="label">\${escapeHtml(headlineFor(req))}</span>
     <span class="figures">\${figures}</span>

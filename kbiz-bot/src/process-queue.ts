@@ -9,6 +9,7 @@ import { scrapeRegisteredAccounts } from "./lib/scrape-registered";
 import { FAVORITES_FILE, scrapeFavorites } from "./lib/scrape-favorites";
 import { loadTransferConfig } from "./lib/transfer-config";
 import { HANDLES_FILE, publishPayeeHandles } from "./lib/payee-handles";
+import { checkPayrollBankSettlements } from "./lib/payroll-bank-check";
 import { htmlToPdf } from "./lib/html-to-pdf";
 import { PUSH_LIFETIME_MS } from "./lib/approval-wait";
 import {
@@ -69,7 +70,7 @@ type PayrollQueueRequest = {
   startedAt?: string;
   completedAt?: string;
   updatedAt?: string;
-  result?: { success: boolean; finalUrl?: string; error?: string };
+  result?: { success: boolean; finalUrl?: string; error?: string; bankReferenceNo?: string };
 };
 
 /**
@@ -709,11 +710,11 @@ async function processBatch(): Promise<number> {
         // runTransferOtherQueueItem uses, expressed through the same
         // `pushMayBeLive` flag.
         //
-        // A normal return from runTransferPayrollFlow means either the URL
-        // changed after Confirm (the tap landed — push consumed) or KBIZ
-        // refused before Confirm was ever clicked (never armed); it never sets
-        // the flag. runAddPayrollFlow does set it, for its one exit that saw
-        // neither a rejection popup nor the notification screen after Next.
+        // Payroll succeeds only on the bank's expected confirmation page.
+        // An auth/error redirect sets pushMayBeLive because it proves neither
+        // acceptance nor a dead push. Pre-Confirm refusals remain never armed.
+        // Add-payroll also sets the flag when neither a rejection popup nor
+        // the notification screen appears after Next.
         // The `catch` below deliberately releases nothing: a throw (including
         // a 5-minute waitForMobileConfirmation timeout) cannot prove the push
         // is dead, so the conservative lock stands until it expires.
@@ -730,7 +731,7 @@ async function processBatch(): Promise<number> {
           await patchRequest(req.id, {
             status: "done",
             completedAt: new Date().toISOString(),
-            result: { success: true, finalUrl: result.finalUrl },
+            result: { success: true, finalUrl: result.finalUrl, ...("bankReferenceNo" in result ? { bankReferenceNo: result.bankReferenceNo } : {}) },
           });
           await notifySlack(`:white_check_mark: Done \`${req.id}\` (${req.type}) → ${result.finalUrl}`);
           console.log(`✅ ${req.id} done`);
@@ -747,9 +748,8 @@ async function processBatch(): Promise<number> {
         // in the transfer-other branch above. list-registered arms nothing,
         // so it must never touch `prev`. `pushMayBeLive` is the only signal
         // (for BOTH flows — see the comment above) that separates "never
-        // armed" from "armed but unresolved"; transfer-payroll's FlowResult
-        // never sets it, so its failures always land on "not-armed", exactly
-        // as its own comment documents.
+        // armed" from "armed but unresolved". An uncertain payroll redirect
+        // must hold later pushes just like an uncertain add-payroll result.
         if (pushLock) {
           prev = result.success
             ? { kind: "armed", id: req.id, outcome: "success" }
@@ -786,6 +786,7 @@ async function main() {
     await publishPayeeHandles(QUEUE_DIR);
     const n = await processBatch();
     if (n === 0) console.log("No approved requests in queue.");
+    await checkPayrollBankSettlements(QUEUE_DIR);
     return;
   }
 
@@ -793,6 +794,7 @@ async function main() {
   // First pass immediately
   await publishPayeeHandles(QUEUE_DIR);
   await processBatch().catch((e) => console.error("batch error:", (e as Error).message));
+  await checkPayrollBankSettlements(QUEUE_DIR).catch(() => console.warn("Payroll bank status check unavailable."));
   // Then loop
   while (true) {
     await new Promise((r) => setTimeout(r, intervalMs));
@@ -801,6 +803,7 @@ async function main() {
       // it on the host reaches the admin dropdown within one poll interval.
       await publishPayeeHandles(QUEUE_DIR);
       await processBatch();
+      await checkPayrollBankSettlements(QUEUE_DIR).catch(() => console.warn("Payroll bank status check unavailable."));
     } catch (e) {
       console.error("batch error:", (e as Error).message);
     }

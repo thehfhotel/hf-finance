@@ -165,3 +165,25 @@ root `bun test` is in before `kbiz-bot/node_modules` exists.
 context without kbiz-bot's node_modules — no test import may reach playwright;
 keep the pure-core/driver file split). `bunx tsc --noEmit -p tsconfig.json`
 strict. No live-KBIZ test runs without the operator watching.
+
+## Payroll completeness verification (2026-09-15)
+
+- `done` payroll is submitted, never automatically paid. The post-phone-approval
+  `getTransactionSuccessPayroll` response supplies `result.bankReferenceNo` for
+  later matching. Only the history verifier writes `payrollSettlement` proof.
+- `PAYROLL_BANK_VERIFY_SINCE` enables verification of recent submitted runs; it is
+  independent of the ledger's new-submission-only cutoff.
+- Live read-only verified: `/menu/account/account/history`, dropdown `#tranType`
+  value `PYRL`, search `#btnSearch`. History inquiry response has decimal-string
+  `amount`, numeric `totalTransactions`, `totalSuccess`, `totalFail`; beneficiary
+  detail has numeric `amount`, full `beneficiaryNo`, `reqRefNo`, `transStatus`.
+  Batch and each recipient must say `Success`, batch approval `AP`, all counts
+  match, and `executeDate === transactionStatusDate` after parsing Bangkok-local
+  SQL timestamps. Never use create/approval/scheduled date as actual paid date.
+- Read-only history checks share the existing serialized queue loop and browser
+  profile. Never start a competing login, arm a push, or invoke transfer/approval
+  APIs from the history reader. New pure core/files modules contain no browser
+  imports so root CI stays Playwright-free.
+- `payroll-bank-core.ts` also imports the pure root `src/payroll-settlement.ts`;
+  the bot Dockerfile copies that file to `/app/src`. Keep the deploy workflow's
+  bot path trigger for this shared helper.

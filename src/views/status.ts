@@ -184,6 +184,23 @@ const STATUS_LABELS = {
   rejected: "ปฏิเสธ", running: "กำลังประมวลผล",
   done: "สำเร็จ", failed: "ไม่สำเร็จ",
 };
+function statusLabel(req) {
+  if (req.type === "transfer-payroll") {
+    if (req.payrollPaidDate) return "จ่ายแล้ว · ธนาคารยืนยัน";
+    if (req.payrollVerificationStatus === "FAILED") return "โอนไม่สำเร็จ";
+    if (req.payrollVerificationStatus === "UNKNOWN") return "รอตรวจสอบผลโอน";
+    if (req.status === "done") return "ส่งธนาคารแล้ว · รอผลโอน";
+  }
+  return STATUS_LABELS[req.status] || req.status;
+}
+function statusTone(req) {
+  if (req.type === "transfer-payroll") {
+    if (req.payrollPaidDate) return "done";
+    if (req.payrollVerificationStatus === "FAILED") return "failed";
+    if (req.status === "done") return "approved";
+  }
+  return req.status;
+}
 const STATE_HINTS = {
   pending: "รอผู้อนุมัติยืนยัน OTP",
   approved: "อนุมัติแล้ว · รอ kbiz-bot รับงาน",
@@ -254,18 +271,25 @@ function headlineFor(req) {
 
 function renderHero(req) {
   const status = req.status;
-  const pillClass = "p-" + status;
-  const cardClass = "hero s-" + status;
+  const pillClass = "p-" + statusTone(req);
+  const cardClass = "hero s-" + statusTone(req);
 
   // Figure line: "23 คน · ฿487,520.50 · เงินเข้า 09/05/2569"
   const bits = [];
   if (req.recipientCount) bits.push(\`\${req.recipientCount} \${req.type === "transfer-payroll" ? "คน" : "บัญชี"}\`);
   if (req.totalAmount != null) bits.push(\`<span class="amount">฿\${fmtAmount(req.totalAmount)}</span>\`);
-  if (req.effectiveDate) bits.push(\`เงินเข้า \${escapeHtml(req.effectiveDate)}\`);
+  if (req.effectiveDate) bits.push(\`กำหนดโอน \${escapeHtml(req.effectiveDate)}\`);
 
   // State line — depends on lifecycle stage.
   let stateHtml = "";
-  if (req.result) {
+  if (req.type === "transfer-payroll" && req.payrollPaidDate) {
+    stateHtml = \`<div class="hero-state success">ธนาคารยืนยันโอนสำเร็จครบทุกคน · วันที่จ่าย \${escapeHtml(req.payrollPaidDate)} · ระบบส่งสถานะไปบัญชีรายจ่ายอัตโนมัติ</div>\`;
+  } else if (req.type === "transfer-payroll" && (req.status === "failed" || req.payrollVerificationStatus === "UNKNOWN")) {
+    stateHtml = \`<div class="hero-state">ยังยืนยันผลโอนไม่ได้ ระบบกำลังตรวจสอบกับธนาคาร กรุณารอผลก่อนส่งเงินเดือนรอบนี้ซ้ำ</div>\`;
+  } else if (req.type === "transfer-payroll" && req.status === "done") {
+    const failed = req.payrollVerificationStatus === "FAILED";
+    stateHtml = \`<div class="hero-state\${failed ? ' failure' : ''}">\${failed ? 'ธนาคารแจ้งว่าโอนไม่สำเร็จ กรุณาตรวจสอบรายละเอียดกับธนาคาร' : 'ส่งคำสั่งให้ธนาคารแล้ว ระบบกำลังตรวจสอบผลโอน ยังไม่ถือว่าจ่ายเงินเดือนสำเร็จ'}</div>\`;
+  } else if (req.result) {
     if (req.result.success) {
       const ref = req.result.referenceNo
         ? \`<span class="label">KBIZ Reference</span><span class="ref">\${escapeHtml(req.result.referenceNo)}</span>\`
@@ -305,7 +329,7 @@ function renderHero(req) {
 
   return \`<div class="\${cardClass}">
     <div class="hero-row1">
-      <span class="pill \${pillClass}">\${STATUS_LABELS[status] || status}</span>
+      <span class="pill \${pillClass}">\${escapeHtml(statusLabel(req))}</span>
       <span class="ago">\${relativeTime(effectiveTime(req))}</span>
     </div>
     <div class="hero-headline">\${escapeHtml(headlineFor(req))}</div>
@@ -329,8 +353,8 @@ function renderRow(req) {
     ? \`<a href="/worksheet?snapshot=\${encodeURIComponent(req.id)}">รายละเอียด</a>
        <a href="/worksheet?snapshot=\${encodeURIComponent(req.id)}&print=1" target="_blank" rel="noopener" title="พิมพ์รายงาน">🖨</a>\`
     : "";
-  return \`<div class="row s-\${req.status}" title="\${escapeHtml(req.id)}">
-    <span class="pill p-\${req.status}">\${STATUS_LABELS[req.status] || req.status}</span>
+  return \`<div class="row s-\${statusTone(req)}" title="\${escapeHtml(req.id)}">
+    <span class="pill p-\${statusTone(req)}">\${escapeHtml(statusLabel(req))}</span>
     <span class="when">\${shortWhen(effectiveTime(req))}</span>
     <span class="label">\${escapeHtml(headlineFor(req))}</span>
     <span class="figures">\${figures}</span>

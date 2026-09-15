@@ -1,7 +1,9 @@
-import type { Page } from "playwright";
+import type { Page, Response } from "playwright";
 import { gotoAuthenticated } from "../lib/session";
 import { nextTimeoutError } from "../lib/next-timeout";
 import { waitForMobileConfirmation } from "../wait";
+import { payrollBankReference } from "../lib/payroll-bank-core";
+import { payrollObject } from "../../../src/payroll-settlement";
 import type { FlowResult } from "./add-payroll-flow";
 
 const URL = "https://kbiz.kasikornbank.com/menu/payroll/upload-transfer";
@@ -43,7 +45,7 @@ const NEXT_SELECTOR =
 const CONFIRM_SELECTOR =
   'a:has-text("Confirm"):visible, a:has-text("ยืนยัน"):visible, button:has-text("Confirm"):visible, button:has-text("ยืนยัน"):visible';
 
-export async function runTransferPayrollFlow(page: Page, xlsxAbs: string): Promise<FlowResult> {
+export async function runTransferPayrollFlow(page: Page, xlsxAbs: string): Promise<FlowResult & { bankReferenceNo?: string }> {
   await gotoAuthenticated(page, URL);
 
   console.log("→ Set file:", xlsxAbs);
@@ -146,15 +148,49 @@ export async function runTransferPayrollFlow(page: Page, xlsxAbs: string): Promi
 
   console.log("→ Click Confirm — KBIZ pushes mobile notification");
   const beforeUrl = page.url();
-  await reviewConfirm.click();
-
-  await waitForMobileConfirmation({
-    reason: "ยืนยันการโอนเงินเดือน (Payroll Transfer)",
-    until: () =>
-      page.waitForURL((url) => url.toString() !== beforeUrl, { timeout: 5 * 60_000 }),
-    timeoutMs: 5 * 60_000,
-  });
-  await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
-
-  return { success: true, finalUrl: page.url() };
+  // This is the bank's post-phone-approval SUBMISSION response. Capturing its
+  // reference binds later history verification to this upload; it is not PAID.
+  let bankReferenceNo: string | undefined;
+  let captureActive = true;
+  const parsing = new Set<Promise<void>>();
+  const capture = (response: Response) => {
+    if (response.url() !== "https://kbiz.kasikornbank.com/services/api/transactioninquiry/getTransactionSuccessPayroll"
+      || response.request().method() !== "POST") return;
+    const pending = response.json().then((body) => {
+      const envelope = payrollObject(body);
+      const data = payrollObject(envelope?.data);
+      const request = payrollObject(response.request().postDataJSON());
+      if (captureActive && response.ok() && envelope?.status === "S"
+        && payrollBankReference(data?.reqRefNo) && data.reqRefNo === request?.reqRefNo) {
+        bankReferenceNo = data.reqRefNo;
+      }
+    }).catch(() => undefined);
+    parsing.add(pending);
+    void pending.finally(() => parsing.delete(pending));
+  };
+  page.on("response", capture);
+  try {
+    await reviewConfirm.click();
+    await waitForMobileConfirmation({
+      reason: "ยืนยันการโอนเงินเดือน (Payroll Transfer)",
+      until: () => page.waitForURL((url) => url.toString() !== beforeUrl, { timeout: 5 * 60_000 }),
+      timeoutMs: 5 * 60_000,
+    });
+    await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
+    // An auth/error redirect also changes the URL. Keep its approval lock
+    // standing and surface uncertainty instead of claiming bank acceptance.
+    if (page.url() !== "https://kbiz.kasikornbank.com/menu/payroll/payroll-confirm") {
+      return { success: false, pushMayBeLive: true, error: "Bank payroll submission could not be confirmed; check K BIZ before retrying." };
+    }
+    // Reference capture is optional metadata. A stalled response body cannot
+    // hold the queue; history matching has a strict no-reference fallback.
+    if (parsing.size) await Promise.race([
+      Promise.allSettled([...parsing]),
+      new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+    ]);
+    return { success: true, finalUrl: page.url(), bankReferenceNo };
+  } finally {
+    captureActive = false;
+    page.off("response", capture);
+  }
 }

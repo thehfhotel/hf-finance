@@ -52,9 +52,9 @@ try {
 await withSession(async (_ctx, page) => {
   const result = await runTransferPayrollFlow(page, abs);
 
-  // RELEASE only on a provably dead outcome: a normal return means either the
-  // URL changed after Confirm (tap landed, push consumed) or KBIZ refused
-  // before Confirm was ever clicked (never armed). A THROW — including the
+  // RELEASE only on a provably dead outcome: the expected bank confirmation
+  // page (tap consumed), or a refusal before Confirm (never armed). An auth or
+  // error redirect sets pushMayBeLive and keeps the lock. A THROW — including the
   // 5-minute waitForMobileConfirmation timeout — skips this deliberately and
   // leaves the conservative lock standing until it expires.
   const pushMayBeLive = !result.success && result.pushMayBeLive === true;
@@ -73,7 +73,7 @@ await withSession(async (_ctx, page) => {
   }
 
   if (result.success) {
-    console.log(`\n✅ Done. final URL: ${result.finalUrl}`);
+    console.log(`\n✅ Submitted to bank. Settlement is verified from payroll history. final URL: ${result.finalUrl}`);
   } else {
     console.error(`\n❌ Failed: ${result.error}`);
     process.exit(1);

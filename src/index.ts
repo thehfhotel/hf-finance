@@ -17,6 +17,8 @@ import { notifySlack } from "./slack";
 import { isValidPeriod, loadSheet, saveSheet } from "./sheets";
 import { CardAssertionError, HF_ID_BASE_URL, cardAssertionJwks, verifyCardAssertion } from "./card";
 import { namesAgree } from "./names";
+import { createPayrollLedgerFeed } from "./ledger-feed";
+import { payrollPaymentDisplay } from "./payroll-settlement";
 
 const staticFile = async (path: string, mime: string) => {
   const buf = await readFile(path);
@@ -145,6 +147,7 @@ function adminGuard(headers: Record<string, string | undefined>, set: { status?:
 
 
 const app = new Elysia()
+  .use(createPayrollLedgerFeed())
   .get("/", ({ headers, redirect }) =>
     isAdminUnlocked(headers) ? renderHTML(MAIN_HTML, "/", true, headers) : redirect("/worksheet", 302)
   )
@@ -178,7 +181,13 @@ const app = new Elysia()
       rejectionReason: r.rejectionReason,
       startedAt: r.startedAt,
       completedAt: r.completedAt,
-      result: r.result,
+      result: r.result ? {
+        success: r.result.success,
+        finalUrl: r.result.finalUrl,
+        referenceNo: r.result.referenceNo,
+        error: r.result.error,
+      } : undefined,
+      ...payrollPaymentDisplay(r),
     }));
   })
 
@@ -532,10 +541,10 @@ const app = new Elysia()
   // /api/queue/status feed for HR. Single-item GET + xlsx are open so
   // that the /worksheet?snapshot=<id> view and the "ดาวน์โหลด xlsx" link
   // on /status work without requiring an admin OTP.
-  .get("/api/queue", ({ headers, set }) => {
+  .get("/api/queue", async ({ headers, set }) => {
     const guard = adminGuard(headers, set);
     if (guard !== true) return guard;
-    return listRequests();
+    return (await listRequests()).map((request) => ({ ...request, ...payrollPaymentDisplay(request) }));
   })
   .get("/api/queue/:id", async ({ params, set }) => {
     const req = await getRequest(params.id);
