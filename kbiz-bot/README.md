@@ -221,3 +221,44 @@ confirmation flows that still need a phone tap.
 - `browser-data/` — persistent Chromium profile (cookies, localStorage)
 - `storageState.json` (legacy, no longer written)
 - traces, screenshots, xlsx test files, `../data/slips/` e-slips
+
+### Payroll transfer completeness (2026-09-15)
+
+The payroll uploader's `done` means the bank accepted the submitted batch.
+It is **not** proof that salaries reached the beneficiaries. The uploader now
+captures the bank's request reference from `getTransactionSuccessPayroll` after
+the existing phone approval. An error/login redirect cannot be treated as success.
+
+The same serialized queue watcher checks bank history every 15 minutes for
+eligible unresolved runs, after active queue work finishes and the approval lock
+is clear. `PAYROLL_BANK_VERIFY_SINCE` is a fixed canonical UTC timestamp; unset or
+invalid disables these checks. It may include recent historical payroll runs to
+correct their displayed payment status. The expense ledger has its own newer
+submission cutoff, so verifying older payroll does not backfill ledger expenses.
+
+The checker visits `/menu/account/account/history` in the bot's existing bank
+session and reads only `getTransactionHistoryMaker` and
+`getPayrollDetailTransaction`. Both APIs were validated read-only against live
+history on 2026-09-15. Complete pagination, exact full beneficiary accounts and
+amounts, total counts, and every beneficiary's `Success` status are required.
+`Success` on the batch also needs approval `AP`, all successful/no failed counts,
+and matching `executeDate` and `transactionStatusDate`. Both bank timestamps are
+parsed as Bangkok time; the execution date becomes the ledger payment date.
+Full recipient details stay in bot memory and are never published.
+
+New runs use the captured bank reference. Older runs lacking a reference can
+match the bank's exact uploaded filename to the request's generated `${id}.xlsx`.
+This disambiguates retry attempts while retaining every recipient/payment check.
+Filename ownership must be unique across the queue and archive; duplicate bank
+uploads of that filename remain ambiguous. There is no case, prefix, path, or
+partial filename matching. A supplied mismatching filename cannot fall back to
+matching amounts. If the bank omits its filename, the older exact-data fallback
+still needs one unique matching bank batch and one unique local run. A reference already
+claimed anywhere in the queue or archive cannot settle another run. Missing,
+partial, ambiguous, changed, or unavailable bank results remain unpaid and show
+an unresolved status. There is no automatic retry of a transfer and no manual
+"mark paid" shortcut. The bank confirmation remains the phone tap.
+
+The pure matcher and file-update tests run from the monorepo without Playwright.
+The reader has a fixed inquiry-only method allowlist. Public bank schema changes
+must fail closed and be revalidated read-only before adapting the parser.
