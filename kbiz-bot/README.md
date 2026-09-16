@@ -175,7 +175,7 @@ lock's real-window refinement fire — a JS-inert click used to be
 indistinguishable in the logs from "the operator didn't tap". If the panel
 never appears, the flow reports `unconfirmed` with `pushMayBeLive: true`
 rather than pretending a push exists; the conservative lock (already on disk
-before the click) covers the gap, so this cannot fail open.
+before the flow is invoked) covers the gap, so this cannot fail open.
 
 **The duplicate-transaction popup.** On an exact duplicate (same payee, same
 amount) KBIZ raises a web confirmation dialog *before* sending the push. The
@@ -222,18 +222,25 @@ confirmation flows that still need a phone tap.
 - `storageState.json` (legacy, no longer written)
 - traces, screenshots, xlsx test files, `../data/slips/` e-slips
 
-### Payroll transfer completeness (2026-09-15)
+### Payroll transfer completeness (2026-09-15; scheduling updated 2026-09-16)
 
 The payroll uploader's `done` means the bank accepted the submitted batch.
 It is **not** proof that salaries reached the beneficiaries. The uploader now
 captures the bank's request reference from `getTransactionSuccessPayroll` after
 the existing phone approval. An error/login redirect cannot be treated as success.
 
-The same serialized queue watcher checks bank history every 15 minutes for
-eligible unresolved runs, after active queue work finishes and the approval lock
-is clear. `PAYROLL_BANK_VERIFY_SINCE` is a fixed canonical UTC timestamp; unset or
-invalid disables these checks. It may include recent historical payroll runs to
-correct their displayed payment status. The expense ledger has its own newer
+The same serialized queue watcher now opens bank history only for due,
+unresolved payroll, after active queue work finishes and the approval lock is
+clear. The first check is on/after the Bangkok pay date (or submission start,
+if later); retries are six hours apart and stop after seven days, settlement
+proof, or a confirmed bank failure. Future pay dates and old backfill records
+do not cause recurring bank logins. Historical backfill is a separate,
+explicit one-shot request handled by this same worker, never a second browser.
+See [PAYROLL-VERIFICATION.md](PAYROLL-VERIFICATION.md) for the scheduling policy,
+manual backfill command, and crash/restart behavior.
+
+`PAYROLL_BANK_VERIFY_SINCE` remains a fixed canonical UTC submission cutoff;
+unset or invalid disables checks. The expense ledger has its own newer
 submission cutoff, so verifying older payroll does not backfill ledger expenses.
 
 The checker visits `/menu/account/account/history` in the bot's existing bank
