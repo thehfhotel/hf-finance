@@ -18,6 +18,15 @@ export type PayrollBankCheckOptions = {
   since?: unknown;
   readArmLock?: () => ReturnType<typeof readArmLockRaw>;
   readHistory?: (query: HistoryQuery) => Promise<PayrollBankBatch[]>;
+  /**
+   * The resident session keeper's Playwright Page (CR-2026-09-17). Typed
+   * `unknown` on purpose: this module is imported by tests that run BEFORE
+   * kbiz-bot's node_modules exist, so it must stay playwright-free even in its
+   * type positions. Supplied → the read-only history check rides the one warm
+   * session instead of launching a second browser and a second bank login.
+   * Omitted → the pre-existing `withSession` path, for the one-shot CLIs.
+   */
+  page?: unknown;
 };
 
 /** Loaded only after all disk-only scheduling and money-session guards pass. */
@@ -25,6 +34,17 @@ async function readHistoryWithSession(query: HistoryQuery): Promise<PayrollBankB
   const { withSession } = await import("./session");
   const { readPayrollBankHistory } = await import("./payroll-bank-reader");
   return withSession(async (_ctx, page) => readPayrollBankHistory(page, query));
+}
+
+/**
+ * Same read, on a page somebody else owns. Read-only exactly as before: it
+ * never starts a competing login, never arms a push and never touches a
+ * transfer/approval API — sharing the keeper's page changes WHICH browser the
+ * inquiry runs in, nothing about what it is allowed to do.
+ */
+async function readHistoryWithPage(page: unknown, query: HistoryQuery): Promise<PayrollBankBatch[]> {
+  const { readPayrollBankHistory } = await import("./payroll-bank-reader");
+  return readPayrollBankHistory(page as Parameters<typeof readPayrollBankHistory>[0], query);
 }
 
 /**
@@ -71,7 +91,12 @@ export async function checkPayrollBankSettlements(
   const display = (d: string) => d.split("-").reverse().join("/");
   let batches: PayrollBankBatch[];
   try {
-    batches = await (options.readHistory ?? readHistoryWithSession)({
+    const readHistory =
+      options.readHistory ??
+      (options.page === undefined
+        ? readHistoryWithSession
+        : (q: HistoryQuery) => readHistoryWithPage(options.page, q));
+    batches = await readHistory({
       startDate: display(minDate),
       endDate: display(today),
       candidateDates: dates,

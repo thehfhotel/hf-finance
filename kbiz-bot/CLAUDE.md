@@ -10,14 +10,54 @@ driver for KBIZ (KBank Business Online), running on evergreen as a
   commit — clicking it sends the approval push to the K BIZ phone app. The bot
   arms; a human approves. Nothing here may bypass, retry-past, or simulate
   that approval, ever.
-- **One warm session.** `withSession` opens a persistent Chromium profile
-  (`browser-data/`). KBIZ punishes concurrent logins — never run two scripts
-  at once, never log in from elsewhere while the bot works. Login used to
-  auto-recover with user/pass alone; since June 2026 it does NOT (see the QR
-  handoff rule below) — a re-login needs a human with the K BIZ phone app.
-- **QR handoff — only the batch warm-up and `src/login.ts` request a scan; the
-  settlement check and every flow refuse.** `gotoAuthenticated`/`ensureLoggedIn`
-  take `{ onQr: "handoff" | "refuse" }` and default to `"refuse"`, which throws
+- **One warm session, and since CR-2026-09-17 a RESIDENT one.** The watch
+  container opens the persistent Chromium profile (`browser-data/`) ONCE at
+  startup and holds it for the process lifetime: the queue step, the 4-minute
+  keepalive ping and the operator's QR login all drive the SAME page
+  (`lib/session-keeper.ts` owns it; `openSession`/`closeSession` in
+  `lib/session.ts` are the primitives, and `withSession` is now just those two
+  around a callback — unchanged for every one-shot script). KBIZ punishes
+  concurrent logins — never run two scripts at once, never log in from
+  elsewhere while the bot works, and NEVER run `npm run login` against the prod
+  profile while the watcher is up (it would fight for the profile lock and kill
+  the resident session). Login used to auto-recover with user/pass alone; since
+  June 2026 it does NOT (see the QR handoff rule below) — a re-login needs a
+  human with the K BIZ phone app.
+- **The bot never starts a login on its own (CR-2026-09-17).** The K BIZ app
+  cannot scan a QR from a saved picture, so a scan always needs a SECOND screen
+  — an unsolicited QR is usually one nobody can use. So the bot keeps its
+  session alive, SAYS what it knows, and waits: `session.json` (written by the
+  keeper on every check and whenever the pending count changes) drives the
+  operator page, and Slack carries four lines — the session ended (once per
+  death, with the lifetime `endedAt - since`, our only instrument for the bank's
+  session cap), work is waiting while dead (on a count change, else hourly), the
+  08:30 Asia/Bangkok reminder (once per day, in the hour after 08:30, only while
+  dead — the day is SEEDED at startup, since the state is memory-only and a
+  redeploy would otherwise re-post it) and "ยังใช้งานได้" when the button is
+  pressed on a session that was fine.
+  **Only the bank's own signals are a death**: `QrLoginRequiredError` and the
+  "still bouncing after a re-login" throw (`isSessionDeathError`). A bank
+  outage, a network blip or a context that vanished mid-navigation is
+  UNCLASSIFIED — counted (by the keepalive AND by the batch warm-up, so with
+  work waiting the strikes come at the 30 s queue cadence), and a death only
+  after three in a row. A death declared on a blip is expensive three times over: a
+  "หมดอายุแล้ว" nobody can act on, the blip written into `lastLifetimeMs`, and a
+  bot that then never re-checks (the keepalive only runs while alive) until a
+  human presses the button. Every note published to `session.json` goes through
+  `maskedNote` — raw Playwright errors carry `loginQR.do?cmd=<token>`.
+  A login begins ONLY when payroll-form writes `login.request` and the bot
+  CLAIMS it by renaming it to `login.request.claimed` BEFORE touching the bank
+  — the same request/claim shape `payroll-bank-backfill.ts` uses, so a crash,
+  an outage or an unscanned QR can never turn one press of the button into a
+  retry loop. All of that is decided in `lib/session-keeper-core.ts` (pure: tick
+  order, rate limits, lifetime arithmetic, Bangkok day boundaries, every Slack
+  line), never in the driver. Do NOT add a SIGTERM/SIGINT handler: playwright
+  already closes the browser on `docker stop` and a second handler races it for
+  the same context.
+- **QR handoff — only the operator's button and `src/login.ts` request a scan;
+  the batch warm-up, the settlement check and every flow refuse.**
+  `gotoAuthenticated`/`ensureLoggedIn` take `{ onQr: "handoff" | "refuse" }` and
+  default to `"refuse"`, which throws
   `QrLoginRequiredError` the instant the bank lands on `loginQR.do` instead of
   waiting 60 s and crashing an item. `"handoff"` publishes the QR to
   `KBIZ_QR_DIR` + Slack and waits 6.5 min for a human. Three files, one job:
@@ -25,19 +65,20 @@ driver for KBIZ (KBank Business Online), running on evergreen as a
   `approval-wait.ts`), `lib/qr-login-files.ts` (fs-only — `QR_DIR`,
   `current.png`/`state.json`, the stale-publication sweep; its `dir` params are
   the test seam) and `lib/qr-login.ts` (the Page-bound driver, the only one
-  that pulls playwright). The 12×500 ms post-navigation session probe both
-  `gotoAuthenticated` and the handoff's `confirmDashboard` run lives once, in
+  that pulls playwright; `lib/session-keeper.ts` runs it on the resident page).
+  The 12×500 ms post-navigation session probe both `gotoAuthenticated` and the
+  handoff's `confirmDashboard` run lives once, in
   `lib/session-probe.ts`; Slack has one voice, `lib/slack.ts`. The handoff runs
-  in exactly two places: `processBatch`'s warm-up (before the item loop, before
-  any claim or arm-lock write, so an unscanned QR costs no item) and the
-  operator's `npm run login` — each passes its own `reason`, which
-  `onQr: "handoff"` requires. A failed warm-up sets a 10-min cooldown
-  (`shouldAttemptLogin`) during which the batch is skipped silently; ONE catch
-  covers both halves — an unscanned QR posts the Thai timeout line and holds
-  the batch, any OTHER reason (including Chromium failing to launch, which
-  happens inside `withSession` before the callback) Slacks one masked English
-  line before it rethrows, so a batch can never stall invisibly. The stale-
-  publication sweep runs at handoff ENTRY, not at process start (payroll-form
+  in exactly two places: the keeper's `login()` (the claimed button press) and
+  the operator's `npm run login` — each passes its own `reason`, which
+  `onQr: "handoff"` requires. `processBatch`'s warm-up is now a CHEAP
+  refuse-policy `ensureLoggedIn(page)` before the item loop, before any claim or
+  arm-lock write: on failure it tells the keeper the session is dead and returns
+  with every item still `approved`, and it Slacks nothing itself (the keeper
+  already says "หมดอายุ" once per death and nudges while work waits). The old
+  `shouldAttemptLogin` 10-minute cooldown is GONE along with the automatic ask
+  it rate-limited; `test/qr-login-warmup.test.ts` now pins that absence. The
+  stale-publication sweep runs at handoff ENTRY, not at process start (payroll-form
   downgrades a stale `waiting` at read time). Never screenshot the QR — decode
   `img.qrcode`'s `src` data URI — and never treat the bank's own redirect as
   proof: confirm the dashboard.
@@ -81,8 +122,10 @@ driver for KBIZ (KBank Business Online), running on evergreen as a
   `bun test` at the repo root, BEFORE kbiz-bot's node_modules even exist,
   proves the invariant (and R5: a slip-capture failure never downgrades a
   bank-confirmed success); `arm-lock.ts` and `qr-login-files.ts` are fs-only (both write through
-  `fs-atomic.ts`'s `writeAtomic`); only `transfer-other-flow.ts`,
-  `process-queue.ts`, `session*.ts` and `qr-login.ts` touch playwright. Never blur
+  `fs-atomic.ts`'s `writeAtomic`; `qr-login-files.ts` also owns `session.json`
+  and the `login.request` read/claim), and `session-keeper-core.ts` is pure like
+  `arm-gate.ts`; only `transfer-other-flow.ts`, `process-queue.ts`,
+  `session*.ts`, `session-keeper.ts` and `qr-login.ts` touch playwright. Never blur
   that split — a runtime playwright import in a pure or test file passes
   locally and breaks root CI.
 
@@ -222,9 +265,12 @@ strict. No live-KBIZ test runs without the operator watching.
   match, and `executeDate === transactionStatusDate` after parsing Bangkok-local
   SQL timestamps. Never use create/approval/scheduled date as actual paid date.
 - Read-only history checks share the existing serialized queue loop and browser
-  profile. Never start a competing login, arm a push, or invoke transfer/approval
-  APIs from the history reader. New pure core/files modules contain no browser
-  imports so root CI stays Playwright-free.
+  profile — since CR-2026-09-17 literally the resident keeper's page, passed in
+  as `checkPayrollBankSettlements(dir, now, { page })`. Omit `page` and it falls
+  back to its own `withSession`, which is what the one-shot CLIs use. Never
+  start a competing login, arm a push, or invoke transfer/approval APIs from the
+  history reader. New pure core/files modules contain no browser imports so root
+  CI stays Playwright-free.
 - `payroll-bank-core.ts` also imports the pure root `src/payroll-settlement.ts`;
   the bot Dockerfile copies that file to `/app/src`. Keep the deploy workflow's
   bot path trigger for this shared helper.

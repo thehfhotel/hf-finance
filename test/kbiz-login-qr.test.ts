@@ -1,18 +1,22 @@
 import { afterAll, describe, expect, it } from "bun:test";
 import { Elysia } from "elysia";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  KBIZ_LOGIN_REQUEST_FILE,
   KBIZ_QR_PNG_FILE,
   KBIZ_QR_ROUTES,
   KBIZ_QR_STATE_FILE,
+  KBIZ_SESSION_FILE,
   kbizLoginQrPageResponse,
   kbizLoginQrPngResponse,
   kbizLoginQrStateResponse,
+  kbizLoginRequestResponse,
   kbizQrDir,
   readKbizQrState,
 } from "../src/kbiz-login-qr";
+import { ACCESS_EMAIL_HEADER } from "../src/property-hint";
 
 const UPDATED = "2026-09-17T04:05:06.000Z";
 const NO_STORE = "private, no-store";
@@ -36,16 +40,47 @@ const waitingState = () => ({
   message: "สแกนภายใน 5 นาที",
 });
 
-/** A fixture handoff dir. `state` is written verbatim when it is a string. */
-async function handoff(state?: unknown, options: { png?: boolean } = {}) {
+// The bot's session keeper writes this one on every check (CR-2026-09-17).
+const sessionFile = (over: Record<string, unknown> = {}) => ({
+  alive: true,
+  since: "2026-09-17T02:00:00.000Z",
+  checkedAt: "2026-09-17T04:00:00.000Z",
+  endedAt: null,
+  lastLifetimeMs: null,
+  pending: 0,
+  note: "keepalive ok",
+  ...over,
+});
+
+/**
+ * A fixture handoff dir. `state` is written verbatim when it is a string;
+ * `session` / `request` are the two files the resident-session CR added.
+ */
+async function handoff(
+  state?: unknown,
+  options: { png?: boolean; session?: unknown; request?: unknown } = {},
+) {
   const dir = await mkdtemp(join(tmpdir(), "kbiz-qr-login-"));
   temporaryDirs.push(dir);
   if (state !== undefined) {
     await writeFile(join(dir, KBIZ_QR_STATE_FILE), typeof state === "string" ? state : JSON.stringify(state));
   }
   if (options.png) await writeFile(join(dir, KBIZ_QR_PNG_FILE), PNG);
+  for (const [file, body] of [
+    [KBIZ_SESSION_FILE, options.session],
+    [KBIZ_LOGIN_REQUEST_FILE, options.request],
+  ] as const) {
+    if (body === undefined) continue;
+    await writeFile(join(dir, file), typeof body === "string" ? body : JSON.stringify(body));
+  }
   return dir;
 }
+
+const requestFor = (dir: string, headers?: Record<string, string | undefined>) =>
+  kbizLoginRequestResponse({ dir, headers });
+
+const requestFileIn = async (dir: string) =>
+  JSON.parse(await readFile(join(dir, KBIZ_LOGIN_REQUEST_FILE), "utf8"));
 
 // The handlers take no Request — they are the route bodies themselves, so the
 // cases below call them directly and only the wiring case goes through Elysia.
@@ -102,7 +137,9 @@ describe("kbiz login QR handoff routes", () => {
     expect(html).toContain("สแกน QR ด้านล่างด้วยแอป K BIZ ภายใน 5 นาที");
     // The poller gets both of its URLs from the boot blob, so the contract
     // paths are spelled server-side once and reach the client unchanged.
-    expect(html).toContain('"routes":{"state":"/kbiz/login-qr/state.json","qrSrc":"/kbiz/login-qr.png?t="}');
+    expect(html).toContain(
+      '"routes":{"state":"/kbiz/login-qr/state.json","qrSrc":"/kbiz/login-qr.png?t=","request":"/kbiz/login-qr/request"}'
+    );
 
     expect(await stateBodyFor(dir)).toEqual(waitingState());
   });
@@ -110,7 +147,7 @@ describe("kbiz login QR handoff routes", () => {
   it("renders the finished states and stops serving the image the moment it stops being scannable", async () => {
     const cases = [
       { status: "ok", copy: "เข้าสู่ระบบ K BIZ เรียบร้อยแล้ว ปิดหน้านี้ได้เลย" },
-      { status: "expired", copy: "QR หมดอายุแล้ว ระบบจะขอ QR ใหม่ให้อีกครั้ง" },
+      { status: "expired", copy: "QR หมดอายุแล้ว กดปุ่มด้านล่างเพื่อขอใหม่เมื่อพร้อม" },
       { status: "error", copy: "อ่านสถานะการเข้าสู่ระบบไม่ได้" },
     ];
     for (const { status, copy } of cases) {
@@ -133,7 +170,7 @@ describe("kbiz login QR handoff routes", () => {
     expect((await pngFor(stale)).status).toBe(404);
     const staleHtml = await htmlFor(stale);
     expect(staleHtml).toContain('data-status="expired"');
-    expect(staleHtml).toContain("QR หมดอายุแล้ว ระบบจะขอ QR ใหม่ให้อีกครั้ง");
+    expect(staleHtml).toContain("QR หมดอายุแล้ว กดปุ่มด้านล่างเพื่อขอใหม่เมื่อพร้อม");
     expect(staleHtml).not.toContain('src="/kbiz/login-qr.png?t=');
 
     // A deadline still ahead is left exactly as published.
@@ -219,10 +256,11 @@ describe("kbiz login QR handoff routes", () => {
       page: "/kbiz/login-qr",
       png: "/kbiz/login-qr.png",
       state: "/kbiz/login-qr/state.json",
+      request: "/kbiz/login-qr/request",
     });
   });
 
-  it("wires all three routes into the app", async () => {
+  it("wires all four routes into the app", async () => {
     const index = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
     for (const [route, handler] of [
       ["page", "kbizLoginQrPageResponse"],
@@ -231,5 +269,255 @@ describe("kbiz login QR handoff routes", () => {
     ]) {
       expect(index).toContain(`.get(KBIZ_QR_ROUTES.${route}, () => ${handler}())`);
     }
+    // The POST is the only one that needs the request's headers — it records
+    // who pressed the button — so the wiring must pass them through.
+    expect(index).toContain(
+      ".post(KBIZ_QR_ROUTES.request, ({ headers }) => kbizLoginRequestResponse({ headers }))"
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CR-2026-09-17 (resident session): the bot never logs in by itself any more.
+// The operator's button writes `login.request`; `session.json` says whether
+// there is anything to ask for.
+// ---------------------------------------------------------------------------
+
+describe("kbiz login request (the operator's button)", () => {
+  it("writes the contract's request file atomically and accepts it", async () => {
+    const dir = await handoff();
+    const before = Date.now();
+    const res = await requestFor(dir, { [ACCESS_EMAIL_HEADER]: "sample-operator@example.com" });
+
+    expect(res.status).toBe(202);
+    expect(res.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    expect(res.headers.get("cache-control")).toBe(NO_STORE);
+    expect(await res.json()).toEqual({ accepted: true });
+
+    const written = await requestFileIn(dir);
+    expect(Object.keys(written).sort()).toEqual(["by", "requestedAt"]);
+    expect(written.by).toBe("sample-operator@example.com");
+    expect(Date.parse(written.requestedAt)).toBeGreaterThanOrEqual(before);
+    // tmp + rename: the bot must never be able to read a half-written request.
+    expect(await readdir(dir)).toEqual([KBIZ_LOGIN_REQUEST_FILE]);
+  });
+
+  it("records 'unknown' rather than junk when Access sends no usable identity", async () => {
+    const junk = [
+      undefined,
+      "",
+      "   ",
+      "a@b\ncom",
+      `${"x".repeat(250)}@example.com`,
+      // Slack renders `<url|label>` as a clickable link with the attacker's
+      // own text, and the bot echoes `by` into its Slack line — so anything
+      // that is not plainly an email address never leaves this app.
+      "<https://evil.example|ok@x.com>",
+      "ok@x.com|https://evil.example",
+      'say "hi"@example.com',
+      "no-at-sign",
+    ];
+    for (const header of junk) {
+      const dir = await handoff();
+      const res = await requestFor(dir, header === undefined ? {} : { [ACCESS_EMAIL_HEADER]: header });
+      expect(res.status).toBe(202);
+      expect((await requestFileIn(dir)).by).toBe("unknown");
+    }
+    // No header bag at all (a direct call) is the same "we do not know".
+    const bare = await handoff();
+    expect((await kbizLoginRequestResponse({ dir: bare })).status).toBe(202);
+    expect((await requestFileIn(bare)).by).toBe("unknown");
+  });
+
+  it("writes one whole request even when many presses land at once", async () => {
+    // A single shared `login.request.tmp` is NOT an atomic write: concurrent
+    // POSTs (two operator tabs, or one page firing twice) open the same tmp
+    // with O_TRUNC and write from offset 0, so the rename can publish a
+    // mixture of two payloads. Different-length identities make any splice
+    // visible; a fresh dir per round keeps every call past the `already` gate.
+    const senders = Array.from({ length: 24 }, (_, i) => `${"o".repeat(i + 1)}@example.com`);
+    for (let round = 0; round < 5; round += 1) {
+      const dir = await handoff();
+      const answers = await Promise.all(senders.map((by) => requestFor(dir, { [ACCESS_EMAIL_HEADER]: by })));
+      for (const answer of answers) expect(answer.status).toBe(202);
+
+      // Whatever landed must be exactly ONE of the payloads, parseable, with
+      // no tmp file left beside it.
+      const written = await requestFileIn(dir);
+      expect(Object.keys(written).sort()).toEqual(["by", "requestedAt"]);
+      expect(senders).toContain(written.by);
+      expect(Number.isFinite(Date.parse(written.requestedAt))).toBe(true);
+      expect(await readdir(dir)).toEqual([KBIZ_LOGIN_REQUEST_FILE]);
+    }
+  });
+
+  it("answers 'already' without rewriting a request the bot may be acting on", async () => {
+    const existing = { requestedAt: "2026-09-17T03:00:00.000Z", by: "sample-operator@example.com" };
+    const dir = await handoff(undefined, { request: existing });
+    const res = await requestFor(dir, { [ACCESS_EMAIL_HEADER]: "someone-else@example.com" });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ accepted: true, already: true });
+    expect(await requestFileIn(dir)).toEqual(existing);
+  });
+
+  it("refuses while a live QR is already on screen, and accepts once it goes stale", async () => {
+    const showing = await handoff(waitingState(), { png: true });
+    const refused = await requestFor(showing, {});
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toEqual({ error: "qr-already-showing" });
+    expect(await readdir(showing)).not.toContain(KBIZ_LOGIN_REQUEST_FILE);
+
+    // A `waiting` past its deadline is not a QR anyone can scan, so asking for
+    // a fresh login is exactly right.
+    const stale = await handoff({ ...waitingState(), expiresAt: PAST }, { png: true });
+    expect((await requestFor(stale, {})).status).toBe(202);
+    expect((await requestFileIn(stale)).by).toBe("unknown");
+
+    // So is asking after a finished handoff.
+    for (const status of ["ok", "expired", "error"]) {
+      const done = await handoff({ ...waitingState(), status });
+      expect((await requestFor(done, {})).status).toBe(202);
+    }
+  });
+
+  it("reports a write it could not make, rather than pretending the bot was asked", async () => {
+    // A path that cannot become a directory: mkdir fails, so nothing is written.
+    const blocked = join(await handoff(waitingState()), KBIZ_QR_STATE_FILE, "nested");
+    const res = await requestFor(blocked, {});
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: "request-write-failed" });
+  });
+
+  it("answers the POST behind a router, passing the Access header through", async () => {
+    const dir = await handoff();
+    const app = new Elysia().post(KBIZ_QR_ROUTES.request, ({ headers }) => kbizLoginRequestResponse({ dir, headers }));
+    const res = await app.handle(
+      new Request(`http://localhost${KBIZ_QR_ROUTES.request}`, {
+        method: "POST",
+        headers: { [ACCESS_EMAIL_HEADER]: "sample-operator@example.com" },
+        body: "ignored",
+      })
+    );
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ accepted: true });
+    expect((await requestFileIn(dir)).by).toBe("sample-operator@example.com");
+  });
+});
+
+describe("kbiz login page states", () => {
+  // The CSS names the views too, so read the card element, not the first match.
+  const viewOf = (html: string) => html.match(/<section id="card"[^>]*data-view="([a-z]+)"/)?.[1];
+
+  it("shows the QR first, whatever the session and the request say", async () => {
+    const dir = await handoff(waitingState(), {
+      png: true,
+      session: sessionFile({ alive: true, pending: 3 }),
+      request: { requestedAt: "2026-09-17T04:00:00.000Z", by: "sample-operator@example.com" },
+    });
+    const html = await htmlFor(dir);
+    expect(viewOf(html)).toBe("qr");
+    expect(html).toContain('data-status="waiting"');
+    expect(html).toContain(`src="/kbiz/login-qr.png?t=${encodeURIComponent(UPDATED)}"`);
+  });
+
+  it("says it is preparing the QR while a request is outstanding, with no button", async () => {
+    const requestedAt = "2026-09-17T04:00:00.000Z";
+    const dir = await handoff(undefined, { request: { requestedAt, by: "sample-operator@example.com" } });
+    const html = await htmlFor(dir);
+    expect(viewOf(html)).toBe("preparing");
+    expect(html).toContain("กำลังเตรียม QR…");
+    expect(html).toContain(`ขอเมื่อ ${requestedAt}`);
+    // A request that landed after a failed handoff still reads as preparing.
+    const afterFailure = await handoff({ ...waitingState(), status: "expired" }, { request: { requestedAt } });
+    expect(viewOf(await htmlFor(afterFailure))).toBe("preparing");
+  });
+
+  it("says the session is alive, with the pending count and nothing to press", async () => {
+    const dir = await handoff(undefined, { session: sessionFile({ pending: 2 }) });
+    const html = await htmlFor(dir);
+    expect(viewOf(html)).toBe("alive");
+    expect(html).toContain("เข้าสู่ระบบ K BIZ อยู่ ตั้งแต่ 2026-09-17T02:00:00.000Z");
+    expect(html).toContain("มีงานรอโอน 2 รายการ");
+  });
+
+  it("offers the button when the session is dead, with the last result and the pending count", async () => {
+    const dir = await handoff(
+      { ...waitingState(), status: "expired", message: "ไม่มีการสแกนใน 6.5 นาที" },
+      { session: sessionFile({ alive: false, endedAt: "2026-09-17T03:30:00.000Z", lastLifetimeMs: 5_400_000, pending: 1 }) }
+    );
+    const html = await htmlFor(dir);
+    expect(viewOf(html)).toBe("button");
+    expect(html).toContain('id="request-btn"');
+    expect(html).toContain("เข้าสู่ระบบ K BIZ</button>");
+    expect(html).toContain("ไม่มีการสแกนใน 6.5 นาที");
+    expect(html).toContain("มีงานรอโอน 1 รายการ");
+    expect(html).toContain("หมดอายุแล้ว");
+    // The button is a POST to the contract's path, from the boot blob.
+    expect(html).toContain('"request":"/kbiz/login-qr/request"');
+  });
+
+  it("renders idle as the button state with no data yet", async () => {
+    const html = await htmlFor(await handoff());
+    expect(viewOf(html)).toBe("button");
+    expect(html).toContain('data-status="idle"');
+    expect(html).toContain("ยังไม่มีข้อมูล");
+    expect(html).toContain("เข้าสู่ระบบ K BIZ</button>");
+  });
+
+  it("carries the session and the request in the one poll the page makes", async () => {
+    const session = sessionFile({ pending: 2 });
+    const request = { requestedAt: "2026-09-17T04:00:00.000Z", by: "sample-operator@example.com" };
+    const dir = await handoff(undefined, { session, request });
+    expect(await stateBodyFor(dir)).toEqual({ status: "idle", session, request });
+
+    // Absent files add no keys at all — `status` alone is still the whole body.
+    expect(await stateBodyFor(await handoff())).toEqual({ status: "idle" });
+  });
+
+  it("forwards only the contract's session and request fields", async () => {
+    const dir = await handoff(undefined, {
+      session: { ...sessionFile(), accountNumber: "1234567890", note: "keepalive ok" },
+      request: { requestedAt: "2026-09-17T04:00:00.000Z", by: "sample-operator@example.com", token: "SAMPLE SECRET" },
+    });
+    const body = await stateBodyFor(dir);
+    expect(body).toEqual({
+      status: "idle",
+      session: sessionFile(),
+      request: { requestedAt: "2026-09-17T04:00:00.000Z", by: "sample-operator@example.com" },
+    });
+    const serialized = JSON.stringify(body);
+    for (const dropped of ["accountNumber", "1234567890", "SAMPLE SECRET", "token"]) {
+      expect(serialized).not.toContain(dropped);
+    }
+  });
+
+  it("never reads a broken session as logged in, and never loses a broken request", async () => {
+    for (const broken of ["{", "null", "[]", '{"alive":"yes"}', '{"pending":2}']) {
+      const dir = await handoff(undefined, { session: broken });
+      const body = await stateBodyFor(dir);
+      expect(body.session).toBeUndefined();
+      expect(viewOf(await htmlFor(dir))).toBe("button");
+    }
+    // The bot claims `login.request` by NAME, so a file it cannot parse is
+    // still a login being prepared — never a second button press on top of it.
+    for (const broken of ["{", "not json", "[]"]) {
+      const dir = await handoff(undefined, { request: broken });
+      expect(await stateBodyFor(dir)).toEqual({ status: "idle", request: { requestedAt: null, by: "unknown" } });
+      expect(viewOf(await htmlFor(dir))).toBe("preparing");
+      expect((await requestFor(dir, {})).status).toBe(202);
+      expect(await (await requestFor(dir, {})).json()).toEqual({ accepted: true, already: true });
+    }
+  });
+
+  it("escapes everything that came off disk", async () => {
+    const dir = await handoff(
+      { ...waitingState(), status: "error", reason: '</script><img src=x onerror=alert(1)>' },
+      { request: { requestedAt: "2026-09-17T04:00:00.000Z", by: '"><script>alert(2)</script>' } }
+    );
+    const html = await htmlFor(dir);
+    expect(html).not.toContain("<img src=x");
+    expect(html).not.toContain("<script>alert(2)</script>");
+    expect(html).toContain("&lt;/script&gt;&lt;img src=x");
+    expect(html).toContain("\\u003c/script>");
   });
 });

@@ -56,8 +56,6 @@ export const QR_POLL_MS = 2_000;
 export const QR_WINDOW_MS = 5 * 60_000 + 55_000;
 /** A rotated QR re-pings Slack at most this often. */
 const QR_NOTIFY_INTERVAL_MS = 60_000;
-/** After a failed handoff, the batch is skipped for this long. */
-export const QR_COOLDOWN_MS = 10 * 60_000;
 
 /**
  * The bank is sitting on `loginQR.do` and this caller is not allowed to ask a
@@ -75,14 +73,44 @@ export class QrLoginRequiredError extends Error {
 
 /**
  * The handoff ran and nobody scanned in time (or the bank bounced back to the
- * credentials form). The work is untouched and still queued; the caller backs
- * off for QR_COOLDOWN_MS before asking again.
+ * credentials form). The work is untouched and still queued, and NOTHING asks
+ * again on its own: since CR-2026-09-17 (resident session) a login starts only
+ * when an operator presses the button on the QR page, so the next attempt is a
+ * human act, not a timer.
  */
 export class QrLoginTimeoutError extends Error {
   constructor(message = "nobody scanned the K BIZ QR in time") {
     super(message);
     this.name = "QrLoginTimeoutError";
   }
+}
+
+/**
+ * The message `gotoAuthenticated` throws when the bank is STILL bouncing us
+ * into the login funnel after a full re-login — the CR's third death signal,
+ * next to `QrLoginRequiredError` and the bank's own "session expired" text
+ * (which the session probe folds into exactly this bounce). It lives here,
+ * beside the error classes, so session.ts's throw and the keeper's classifier
+ * read ONE literal and cannot drift apart.
+ */
+export const SESSION_BOUNCE_ERROR = "After re-login still bouncing";
+
+/**
+ * Is this failure PROOF that the K BIZ session is gone, or just a blip?
+ *
+ * Only the CR's death signals count: the bank asked for a scan
+ * (`QrLoginRequiredError`), or it kept bouncing us after a re-login. Anything
+ * else — a bank outage timing out the login form, a network failure, a crashed
+ * or closed context — is UNCLASSIFIED, and the keeper retries it at the next
+ * keepalive instead of declaring a death. A false death costs three things at
+ * once: a ":warning: หมดอายุแล้ว" line nobody can act on, a blip recorded as
+ * `lastLifetimeMs` (the one instrument we have for the bank's session cap),
+ * and a bot that then sits waiting for a human it does not need.
+ */
+export function isSessionDeathError(e: unknown): boolean {
+  if (e instanceof QrLoginRequiredError) return true;
+  const message = e instanceof Error ? e.message : String(e ?? "");
+  return message.includes(SESSION_BOUNCE_ERROR);
 }
 
 export type QrLoginStatus = "waiting" | "ok" | "expired" | "error";
@@ -148,7 +176,50 @@ export function qrSuccessMessage(reason: string): string {
 }
 
 export function qrTimeoutMessage(): string {
-  return ":hourglass: kbiz-bot: ไม่มีการสแกนใน 6.5 นาที — งานยังรออยู่ จะขอใหม่ใน 10 นาที";
+  return ":hourglass: kbiz-bot: ไม่มีการสแกนใน 6.5 นาที — งานยังรออยู่ กดปุ่มใหม่เมื่อพร้อม";
+}
+
+/** The button the three resident-session lines below all point at. One copy,
+ *  so the operator reads the same words in Slack and on the page. */
+const LOGIN_BUTTON_LABEL = 'กด "เข้าสู่ระบบ K BIZ"';
+
+/**
+ * `18_600_000` → `"5 ชม. 10 นาที"`. Both units always, so the line reads the
+ * same whether a session lasted 40 minutes or 9 hours — this number is the
+ * instrument that tells us the bank's session cap, and a format that drops the
+ * hours would make two readings hard to compare at a glance. A null/negative
+ * lifetime (a session we inherited and never saw start) says so in words
+ * rather than printing a nonsense duration.
+ */
+export function formatSessionLifetime(ms: number | null | undefined): string {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return "ไม่ทราบระยะเวลา";
+  const totalMinutes = Math.floor(ms / 60_000);
+  return `${Math.floor(totalMinutes / 60)} ชม. ${totalMinutes % 60} นาที`;
+}
+
+/** The session we were keeping alive has ended. Once per death. */
+export function sessionEndedMessage(opts: { lifetimeMs: number | null; pageUrl: string }): string {
+  return (
+    `:warning: kbiz-bot: เซสชัน K BIZ หมดอายุแล้ว (อยู่ได้ ${formatSessionLifetime(opts.lifetimeMs)}) — ` +
+    `เมื่อมีจอที่สองแล้ว เปิด ${opts.pageUrl} แล้ว${LOGIN_BUTTON_LABEL}`
+  );
+}
+
+/** Approved work is waiting and there is no session to run it with. */
+export function workWaitingMessage(opts: { count: number; pageUrl: string }): string {
+  return `:hourglass: kbiz-bot: มี ${opts.count} งานรอ K BIZ — เปิด ${opts.pageUrl} แล้ว${LOGIN_BUTTON_LABEL}`;
+}
+
+/** 08:30 Asia/Bangkok, once per day, only while dead. */
+export function loginReminderMessage(opts: { pageUrl: string }): string {
+  return `:sunrise: kbiz-bot: เซสชัน K BIZ ยังไม่ได้เข้าสู่ระบบ — เปิด ${opts.pageUrl} แล้ว${LOGIN_BUTTON_LABEL}`;
+}
+
+/** The button was pressed while the session was in fact still good. Nothing to
+ *  scan, and no QR is published — the operator is told so instead of being
+ *  left watching an empty page. */
+export function sessionAliveMessage(): string {
+  return ":white_check_mark: kbiz-bot: เซสชัน K BIZ ยังใช้งานได้ ไม่ต้องสแกน";
 }
 
 // ── Masking ───────────────────────────────────────────────────────────────
@@ -166,6 +237,18 @@ export function maskQrMessage(text: string): string {
     .replace(/\d{6,}/g, "******")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/**
+ * The ONE shape a `session.json` note may take: masked, collapsed to a single
+ * line and short enough to read on the operator page. Every note that reaches
+ * the file goes through this — a raw Playwright navigation/locator error
+ * carries a multi-line call log and, since June 2026, the bank's own
+ * `loginQR.do?cmd=<session token>` URL, which is precisely what `maskQrMessage`
+ * exists to strip before a Cloudflare-gated page renders it.
+ */
+export function maskedNote(text: string): string {
+  return maskQrMessage(text).slice(0, 160);
 }
 
 // ── Data-URI decoding ─────────────────────────────────────────────────────
@@ -197,24 +280,6 @@ export function decodeQrDataUri(dataUri: string): Uint8Array {
     throw new Error("QR image bytes are not a PNG");
   }
   return bytes;
-}
-
-// ── Cooldown ──────────────────────────────────────────────────────────────
-
-/**
- * May the batch try to log in right now? False only while a failed login's
- * cooldown is still running — that is the whole "skip the batch quietly, no
- * second Slack ping" rule, expressed as a pure function so it is testable
- * without a queue, a browser or a clock. It governs the whole warm-up, not
- * just the scan: an unscanned QR and a bank outage back off the same way.
- */
-export function shouldAttemptLogin(
-  now: number,
-  lastLoginFailAt: number | null | undefined,
-  cooldownMs: number = QR_COOLDOWN_MS,
-): boolean {
-  if (lastLoginFailAt === null || lastLoginFailAt === undefined) return true;
-  return now - lastLoginFailAt >= cooldownMs;
 }
 
 // ── State builders ────────────────────────────────────────────────────────
