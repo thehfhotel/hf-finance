@@ -1,7 +1,7 @@
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import type { Page } from "playwright";
-import { withSession, gotoAuthenticated } from "./lib/session";
+import { withSession, gotoAuthenticated, ensureLoggedIn } from "./lib/session";
 import { runAddPayrollFlow } from "./flows/add-payroll-flow";
 import { runTransferPayrollFlow } from "./flows/transfer-payroll-flow";
 import { runTransferOtherFlow } from "./flows/transfer-other-flow";
@@ -26,6 +26,14 @@ import {
   type PrevMoneyItem,
 } from "./lib/arm-gate";
 import { readArmLockRaw, writeArmLock } from "./lib/arm-lock";
+import { clearStaleQrPublication, notifySlack } from "./lib/qr-login";
+import {
+  maskQrMessage,
+  QrLoginTimeoutError,
+  QR_COOLDOWN_MS,
+  qrTimeoutMessage,
+  shouldRequestQr,
+} from "./lib/qr-login-core";
 import {
   decideDuplicateConfirm,
   describeDestination,
@@ -58,7 +66,15 @@ const QUEUE_DIR = process.env.KBIZ_QUEUE_DIR ? resolve(process.env.KBIZ_QUEUE_DI
 // against. Defaults to `../data`, matching QUEUE_DIR's and capture-slip's
 // default `../data/{queue,slips}` so the three line up unless overridden.
 const SHARED_DIR = process.env.KBIZ_SHARED_DIR ? resolve(process.env.KBIZ_SHARED_DIR) : resolve("..", "data");
-const SLACK = process.env.SLACK_WEBHOOK_URL;
+
+/**
+ * When the last QR handoff gave up with nobody scanning. In-process on
+ * purpose (unlike the arm lock, which MUST be durable): a restart is a human
+ * act, and a human who just restarted the bot is exactly the human who is
+ * about to scan. Nothing here can double-pay — the cooldown only decides
+ * whether to ASK for a scan.
+ */
+let lastQrFailAt: number | null = null;
 
 /** The add-payroll / transfer-payroll / list-registered queue-item shape. */
 type PayrollQueueRequest = {
@@ -92,16 +108,10 @@ type SyncQueueRequest = {
 
 type QueueRequest = PayrollQueueRequest | TransferOtherQueueRequest | SyncQueueRequest;
 
-async function notifySlack(text: string) {
-  if (!SLACK) return;
-  try {
-    await fetch(SLACK, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
-  } catch {}
-}
+// notifySlack now lives in lib/qr-login.ts (imported above) so the handoff
+// driver and this loop post through one helper with one set of
+// never-throw semantics. Behaviour is unchanged: unset SLACK_WEBHOOK_URL is a
+// no-op, and a failed POST is swallowed.
 
 async function listApproved(): Promise<QueueRequest[]> {
   const files = await readdir(QUEUE_DIR).catch(() => [] as string[]);
@@ -430,6 +440,18 @@ async function runTransferOtherQueueItem(
 async function processBatch(): Promise<number> {
   const approved = await listApproved();
   if (approved.length === 0) return 0;
+
+  // A failed handoff means nobody is at the computer. Asking again 30 s later
+  // would republish a QR nobody is waiting for and re-ping Slack every poll,
+  // so the whole batch is skipped — quietly, one log line, no Slack — until
+  // the cooldown runs out. Nothing is claimed, so every item stays `approved`
+  // and the next successful warm-up picks the same batch up untouched.
+  if (!shouldRequestQr(Date.now(), lastQrFailAt)) {
+    const waitS = Math.ceil((QR_COOLDOWN_MS - (Date.now() - lastQrFailAt!)) / 1000);
+    console.log(`⏸ ${approved.length} approved request(s) held — waiting ${waitS}s before asking K BIZ to log in again`);
+    return approved.length;
+  }
+
   console.log(`\n[${new Date().toISOString()}] Processing ${approved.length} approved request(s) …`);
 
   // Money items' 1-based position in THIS batch snapshot ("transfer 2/2").
@@ -451,7 +473,44 @@ async function processBatch(): Promise<number> {
   // (an operator's Retry lands in a fresh batch 30 s later, with `prev` back
   // to "none" — only the on-disk lock can hold that one).
   let prev: PrevMoneyItem = { kind: "none" };
+  // Set only once the warm-up has a confirmed session. The outer catch below
+  // uses it to tell "we never got a session" (launch failure, wrong password,
+  // bank outage — nothing claimed, so it must be REPORTED or the batch stalls
+  // invisibly) from a throw after items were already being processed (the
+  // pre-existing behaviour, left exactly as it was).
+  let warmedUp = false;
+  try {
   await withSession(async (_ctx, page) => {
+    // ── THE WARM-UP ───────────────────────────────────────────────────────
+    // Log in FIRST, before the item loop, before any claim, before any
+    // arm-lock write. K BIZ has demanded a QR scan on every web login since
+    // June 2026, and the login used to happen lazily inside the first item's
+    // gotoAuthenticated — so a re-login crashed whichever item happened to be
+    // first (`running`, then `failed`) and left its conservative arm lock
+    // standing for ~10 min. Doing it here means a scan we cannot get costs
+    // nothing: no item is touched, they all stay `approved`.
+    //
+    // This is the ONE queue path allowed to summon a human ("handoff"). The
+    // payroll settlement check that runs after this batch keeps the default
+    // "refuse" — a QR page makes it give up at once into its existing
+    // BANK_CHECK_UNAVAILABLE + 6-hour retry.
+    try {
+      await ensureLoggedIn(page, { onQr: "handoff", reason: `${approved.length} approved item(s)` });
+      lastQrFailAt = null;
+      warmedUp = true;
+    } catch (e) {
+      // Nobody scanned: the items are untouched and the next ask is bounded
+      // by the cooldown. Any OTHER failure falls through to the outer catch
+      // below, which owns the "no session" signal for this AND for a
+      // Chromium launch failure (which happens inside withSession, before
+      // this callback ever runs).
+      if (!(e instanceof QrLoginTimeoutError)) throw e;
+      lastQrFailAt = Date.now();
+      await notifySlack(qrTimeoutMessage());
+      console.log(`⛔ no K BIZ QR scan — ${approved.length} request(s) left approved, retrying in 10 min`);
+      return;
+    }
+
     for (const req of approved) {
       console.log(`\n=== ${req.id}  (${req.type}) ===`);
 
@@ -775,12 +834,42 @@ async function processBatch(): Promise<number> {
       }
     }
   });
+  } catch (e) {
+    if (!warmedUp) {
+      // We never had a session: a login that failed for a NON-QR reason (a
+      // wrong password, a bank outage, "After re-login still bouncing") or
+      // Chromium failing to launch (e.g. the profile is held by a one-off
+      // pre-warm container). Nothing was claimed, so the batch would otherwise
+      // sit at `approved` forever with the failure visible only in a container
+      // log nobody reads. The cooldown rate-limits this to one line per
+      // 10 min. English (the contract fixes Thai copy for its three defined
+      // lines only) and masked — an error string can carry the bank's
+      // `loginQR.do?cmd=<token>`.
+      lastQrFailAt = Date.now();
+      await notifySlack(
+        maskQrMessage(
+          `:x: kbiz-bot: K BIZ login failed (${approved.length} approved item(s)) — ` +
+            `${(e as Error).message}; retrying in 10 min`,
+        ),
+      );
+    }
+    throw e;
+  }
   return approved.length;
 }
 
 async function main() {
   const watch = process.argv.includes("--watch");
   const intervalMs = Number(process.env.QUEUE_POLL_MS ?? 30_000);
+
+  // A leftover `current.png` means "a live QR is waiting" to the operator page
+  // (it gates the image on `status === "waiting"`, not on `expiresAt`), and a
+  // process that is only now starting cannot have one: anything on disk here
+  // survived a handoff that was killed mid-flow — a deploy recreates this
+  // container on every merge. Sweep it once, before the first batch, and
+  // settle a stale `waiting` state.json to `expired` so the page does not keep
+  // showing a dead handoff's reason and countdown.
+  clearStaleQrPublication();
 
   if (!watch) {
     await publishPayeeHandles(QUEUE_DIR);

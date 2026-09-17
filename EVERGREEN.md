@@ -149,7 +149,8 @@ rendered voucher HTML, and the captured e-slip need to live in a dir shared
 by `kbiz-bot`, `payroll-form`, and `reimbursement-api`, three containers that
 may belong to different compose stacks.
 
-The bot side reads three env vars, each independently defaulted so nothing
+The bot side reads three env vars for the shared queue (plus two optional ones
+for the K BIZ QR login handoff, below), each independently defaulted so nothing
 changes until they're set:
 
 | env var           | default (today)      | meaning                                              |
@@ -157,6 +158,8 @@ changes until they're set:
 | `KBIZ_QUEUE_DIR`   | `../data/queue`       | where `process-queue.ts` watches for approved items    |
 | `KBIZ_SLIPS_DIR`   | `../data/slips`       | where captured e-slip screenshots are written          |
 | `KBIZ_SHARED_DIR`  | `../data`             | root a `transfer-other` intent's relative paths (`voucherFile`) resolve against |
+| `KBIZ_QR_DIR`      | bot `../data/qr-login`, payroll-form `data/qr-login` | optional, BOTH containers: where the bot publishes the K BIZ login QR (`current.png` + `state.json`) and payroll-form reads it back — same host path `/home/deploy/payroll-production/data/qr-login`, so leave it unset |
+| `KBIZ_QR_PAGE_URL` | `https://payroll.thehfhotel.org/kbiz/login-qr` | optional, bot only: the link Slack sends the operator; the page is gated by the existing whole-hostname `payroll.thehfhotel.org` Cloudflare Access app (no Cloudflare change, no origin auth) |
 
 > **Snap-Docker constraint (why these paths live under `/home/deploy`):**
 > evergreen runs Docker as a snap. The confined daemon cannot use bind
