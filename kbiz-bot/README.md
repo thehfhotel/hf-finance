@@ -103,7 +103,7 @@ and patches the result back into the same file. Item `type`:
   exactly this; if you run `process-queue.ts` outside the container, make
   sure your machine has a Thai font too or the PDF will show tofu boxes.
 
-Three env vars decouple the bot's data dir from its default `../data` layout
+These env vars decouple the bot's data dir from its default `../data` layout
 (all optional; unset preserves today's behavior):
 
 | env var          | default          | what it's for                                                        |
@@ -111,6 +111,8 @@ Three env vars decouple the bot's data dir from its default `../data` layout
 | `KBIZ_QUEUE_DIR`  | `../data/queue` | where the watch loop looks for queue files                          |
 | `KBIZ_SLIPS_DIR`  | `../data/slips` | where captured e-slip screenshots are written                       |
 | `KBIZ_SHARED_DIR` | `../data`       | root a `transfer-other` intent's relative paths (`voucherFile`) resolve against |
+| `KBIZ_QR_DIR`     | `../data/qr-login` | where the login QR + its `state.json` are published for payroll-form |
+| `KBIZ_QR_PAGE_URL` | `https://payroll.thehfhotel.org/kbiz/login-qr` | the link Slack sends the operator |
 
 See `EVERGREEN.md` for the `/srv/kbiz-queue` cross-repo mount this is meant
 to enable in production — and, alongside it, the separate `/srv/kbiz-bot`
@@ -198,12 +200,65 @@ All scripts go through `src/lib/session.ts`:
   `browser-data/`. The same browser profile is reused across every
   script — KBIZ sees one continuous browser, no
   "signed-in-on-another-device" cascades.
-- `ensureLoggedIn(page)` is idempotent: navigates to the dashboard,
+- `ensureLoggedIn(page, opts?)` is idempotent: navigates to the dashboard,
   returns immediately if already authenticated, otherwise runs the
-  login flow.
+  login flow — which now needs a QR scan (below).
 
 Don't run two scripts concurrently — they would deadlock on
 Chromium's user-data-dir lock. Run one at a time.
+
+## Logging in needs a QR scan (operator guide)
+
+Since June 2026 K BIZ asks for a scan from the **K BIZ phone app** after
+user/pass on every web login. There is no unattended way past it, so the bot
+hands the scan off to a human:
+
+**What the Slack message means.**
+
+> :lock: kbiz-bot: K BIZ ต้องสแกน QR เพื่อเข้าสู่ระบบ (2 approved item(s), QR #1)
+> — เปิด https://payroll.thehfhotel.org/kbiz/login-qr บนคอมพิวเตอร์
+> แล้วสแกนด้วยแอป K BIZ ภายใน 5 นาที
+
+The bot is parked at the bank's login QR page with work waiting (here: two
+approved queue items) and it has published the code. To clear it:
+
+1. **Open the link on a computer** — `https://payroll.thehfhotel.org/kbiz/login-qr`,
+   the same Cloudflare Access login as the rest of payroll-form. It has to be a
+   screen you can point the phone at, so not the phone running K BIZ itself.
+2. **Scan the QR with the K BIZ app** (the app's own scan button, the same one
+   you use to log in yourself).
+3. **You have ~5 minutes.** The page shows the bank's countdown and refreshes
+   itself every 5 s; if the bank rotates the code the picture swaps on its own
+   and Slack re-pings at most once a minute (`QR #2`, `QR #3`, …).
+
+Then `:white_check_mark: kbiz-bot: เข้าสู่ระบบ K BIZ แล้ว (…)` means the session is
+live and the batch runs. `:hourglass: … ไม่มีการสแกนใน 6.5 นาที` means nobody
+scanned: **nothing was touched** — every item is still `approved` — and the bot
+asks again in 10 minutes. Scanning the phone-app login by hand in the meantime
+does not help; wait for the next ask, or pre-warm (below).
+
+The page is the *only* place the code is published: the bot writes
+`current.png` + `state.json` into `KBIZ_QR_DIR`, the PNG decoded from the login
+page's own `img.qrcode` data URI. It is never a screenshot, and the QR file is
+deleted the moment the handoff ends.
+
+**Pre-warming before a known batch.** The watch container holds the browser
+profile, so you cannot just run `npm run login` beside it. Use the wrapper —
+it pauses the watcher, runs the login once, and unpauses in a trap.
+
+The script is NOT on evergreen: the deploy tarball ships `docker-compose.yml`
+and nothing else, and the image copies only `kbiz-bot/src`. Copy it over first
+(it `cd`s to the compose dir itself, so where it lands does not matter):
+
+```sh
+scp kbiz-bot/scripts/kbiz-login-handoff.sh evergreen:~/
+ssh evergreen bash '~/kbiz-login-handoff.sh'
+```
+
+(It re-executes itself under `sudo -n`: the compose dir's `.env` is root-only
+on evergreen and `docker compose` has to read it.) It only requests the scan; it never arms, taps or approves anything — and it
+refuses to pause the watcher while an approval push is live, so run it between
+batches, not on top of one.
 
 ## DRY mobile-approval helper
 

@@ -12,8 +12,27 @@ driver for KBIZ (KBank Business Online), running on evergreen as a
   that approval, ever.
 - **One warm session.** `withSession` opens a persistent Chromium profile
   (`browser-data/`). KBIZ punishes concurrent logins — never run two scripts
-  at once, never log in from elsewhere while the bot works. Login auto-recovers
-  with user/pass (no phone tap needed for login).
+  at once, never log in from elsewhere while the bot works. Login used to
+  auto-recover with user/pass alone; since June 2026 it does NOT (see the QR
+  handoff rule below) — a re-login needs a human with the K BIZ phone app.
+- **QR handoff — only the batch warm-up and `src/login.ts` request a scan; the
+  settlement check and every flow refuse.** `gotoAuthenticated`/`ensureLoggedIn`
+  take `{ onQr: "handoff" | "refuse" }` and default to `"refuse"`, which throws
+  `QrLoginRequiredError` the instant the bank lands on `loginQR.do` instead of
+  waiting 60 s and crashing an item. `"handoff"` publishes the QR to
+  `KBIZ_QR_DIR` + Slack and waits 6.5 min for a human
+  (`lib/qr-login-core.ts` pure, `lib/qr-login.ts` driver; the 12×500 ms
+  post-navigation session probe both `gotoAuthenticated` and the handoff's
+  `confirmDashboard` run lives once, in `lib/session-probe.ts`). It runs in
+  exactly two places: `processBatch`'s warm-up (before the item loop, before
+  any claim or arm-lock write, so an unscanned QR costs no item) and the
+  operator's `npm run login`. A failed handoff sets a 10-min cooldown
+  (`shouldRequestQr`) during which the batch is skipped silently — a warm-up
+  that failed for a NON-QR reason — including Chromium failing to launch,
+  which happens inside `withSession` before the callback — Slacks one masked
+  English line before it rethrows, so a batch can never stall invisibly. Never
+  screenshot the QR — decode `img.qrcode`'s `src` data URI — and never treat
+  the bank's own redirect as proof: confirm the dashboard.
 - **Ambiguity is never auto-resolved.** Outcomes are four-way: success /
   confirmed-failed (retryable — the bank explicitly rejected it, nothing
   moved) / push-expired (retryable — the bank's own expiry modal, the ~6 min
@@ -123,6 +142,15 @@ root `bun test` is in before `kbiz-bot/node_modules` exists.
   payroll run of 2026-09-04 (Next matched at once, Confirm armed the push, the
   tap landed, item done). The account-payroll page is still unprobed under
   Thai — its next live add-payroll run is the verification.
+- **Login needs a QR scan, every time (live-verified 2026-09-17).** After
+  `#loginBtn` the bank redirects to `/authen/loginQR.do?cmd=…` — an `/authen/`
+  URL, so `isUnauthenticatedUrl` matches it and the old `waitForURL` could only
+  ever time out there. The page renders `img.qrcode`, a 150×150
+  `data:image/png;base64` data URI, under "กรุณาทำรายการภายใน 05:55 นาที", and
+  the bank redirects ITSELF to `/menu/account/account-summary` once the app
+  confirms. The QR rotates; each fresh one is a new `attempt`. There is no
+  unattended path — bank policy — so the only correct responses are "refuse
+  now" or "ask a human".
 - **K BIZ payroll deadline (page copy, 2026-09-04):** a batch must be approved
   by 17:00 at least one day before the pay date, or KBIZ refuses it.
 - **`page.evaluate` + tsx:** esbuild's keepNames wraps any NAMED inner function
