@@ -1,7 +1,7 @@
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import type { Page } from "playwright";
-import { withSession, gotoAuthenticated, ensureLoggedIn } from "./lib/session";
+import { gotoAuthenticated, ensureLoggedIn } from "./lib/session";
 import { runAddPayrollFlow } from "./flows/add-payroll-flow";
 import { runTransferPayrollFlow } from "./flows/transfer-payroll-flow";
 import { runTransferOtherFlow } from "./flows/transfer-other-flow";
@@ -28,12 +28,36 @@ import {
 import { readArmLockRaw, writeArmLock } from "./lib/arm-lock";
 import { notifySlack } from "./lib/slack";
 import {
+  DEFAULT_QR_PAGE_URL,
+  isSessionDeathError,
+  maskedNote,
   maskQrMessage,
-  QrLoginTimeoutError,
-  QR_COOLDOWN_MS,
   qrTimeoutMessage,
-  shouldAttemptLogin,
+  sessionAliveMessage,
 } from "./lib/qr-login-core";
+import { claimLoginRequest, readLoginRequest, writeSessionFile } from "./lib/qr-login-files";
+import { createSessionKeeper, type KeeperCheckResult } from "./lib/session-keeper";
+import {
+  applyCheckResult,
+  DEFAULT_KEEPALIVE_MS,
+  DEFAULT_QUEUE_POLL_MS,
+  DEFAULT_REMINDER_HHMM,
+  DEFAULT_TICK_MS,
+  decideTick,
+  initialKeeperState,
+  isAlive,
+  keeperSlackLine,
+  markQueueRan,
+  markReopened,
+  parseReminderHhmm,
+  seedReminderDay,
+  sessionFileFrom,
+  setPending,
+  withNote,
+  type KeeperAction,
+  type KeeperConfig,
+  type KeeperState,
+} from "./lib/session-keeper-core";
 import {
   decideDuplicateConfirm,
   describeDestination,
@@ -66,15 +90,6 @@ const QUEUE_DIR = process.env.KBIZ_QUEUE_DIR ? resolve(process.env.KBIZ_QUEUE_DI
 // against. Defaults to `../data`, matching QUEUE_DIR's and capture-slip's
 // default `../data/{queue,slips}` so the three line up unless overridden.
 const SHARED_DIR = process.env.KBIZ_SHARED_DIR ? resolve(process.env.KBIZ_SHARED_DIR) : resolve("..", "data");
-
-/**
- * When the last batch warm-up failed to get a session (nobody scanned, or the
- * login failed for any other reason). In-process on purpose (unlike the arm
- * lock, which MUST be durable): a restart is a human act, and a human who just
- * restarted the bot is exactly the human who is about to scan. Nothing here
- * can double-pay — the cooldown only decides whether to ASK for a scan.
- */
-let lastLoginFailAt: number | null = null;
 
 /** The add-payroll / transfer-payroll / list-registered queue-item shape. */
 type PayrollQueueRequest = {
@@ -432,20 +447,35 @@ async function runTransferOtherQueueItem(
   };
 }
 
-async function processBatch(): Promise<number> {
+/**
+ * Run every approved queue item on the RESIDENT keeper's page.
+ *
+ * CR-2026-09-17: this function no longer opens a browser. The keeper owns the
+ * one persistent context for the process lifetime and hands its page in, so a
+ * batch can start the instant work lands instead of paying a Chromium launch
+ * and a bank login per poll. Nothing INSIDE the item loop changed: the gate,
+ * the claim, the arm lock, the ordering and the phone tap are exactly as they
+ * were.
+ *
+ * `onSessionDead` is how a failed warm-up reaches the keeper — the batch never
+ * Slacks about a dead session itself, because the keeper already says it once
+ * per death ("เซสชัน K BIZ หมดอายุแล้ว") and nudges while work waits.
+ */
+/** What the warm-up tells the keeper when it cannot get a session. `note` is
+ *  already masked and truncated; `unclassified` says the failure carried none
+ *  of the contract's death signals, so the keeper counts it instead of
+ *  declaring a death (session-keeper-core.ts). */
+export interface SessionDeadReport {
+  note: string;
+  unclassified: boolean;
+}
+
+async function processBatch(
+  page: Page,
+  hooks: { onSessionDead?: (report: SessionDeadReport) => void } = {},
+): Promise<number> {
   const approved = await listApproved();
   if (approved.length === 0) return 0;
-
-  // A failed handoff means nobody is at the computer. Asking again 30 s later
-  // would republish a QR nobody is waiting for and re-ping Slack every poll,
-  // so the whole batch is skipped — quietly, one log line, no Slack — until
-  // the cooldown runs out. Nothing is claimed, so every item stays `approved`
-  // and the next successful warm-up picks the same batch up untouched.
-  if (!shouldAttemptLogin(Date.now(), lastLoginFailAt)) {
-    const waitS = Math.ceil((QR_COOLDOWN_MS - (Date.now() - lastLoginFailAt!)) / 1000);
-    console.log(`⏸ ${approved.length} approved request(s) held — waiting ${waitS}s before asking K BIZ to log in again`);
-    return approved.length;
-  }
 
   console.log(`\n[${new Date().toISOString()}] Processing ${approved.length} approved request(s) …`);
 
@@ -455,7 +485,9 @@ async function processBatch(): Promise<number> {
   // to go look (2026-08-12 + 2026-08-13 incidents, both second-of-pair).
   const positions = transferOtherPositions(approved);
 
-  // Single Chromium session, sequential — KBIZ kills concurrent sessions.
+  // ONE Chromium session, sequential — KBIZ kills concurrent sessions. Since
+  // CR-2026-09-17 it is the RESIDENT keeper's, shared with the keepalive ping
+  // and the operator login, which is why the page arrives as a parameter.
   // Money transfers after the first in a batch get a deliberate gap before
   // their push is armed: TAP_COOLDOWN_MS (arm-gate.ts), unchanged at 90s but
   // now ALSO the cross-poll cooldown (kbiz-fix-spec.md §1.2/§2.4) — the value
@@ -468,414 +500,621 @@ async function processBatch(): Promise<number> {
   // (an operator's Retry lands in a fresh batch 30 s later, with `prev` back
   // to "none" — only the on-disk lock can hold that one).
   let prev: PrevMoneyItem = { kind: "none" };
-  // Set only once the warm-up has a confirmed session. The catch below uses it
-  // to tell "we never got a session" (launch failure, wrong password, bank
-  // outage — nothing claimed, so it must be REPORTED or the batch stalls
-  // invisibly) from a throw after items were already being processed (the
-  // pre-existing behaviour, left exactly as it was).
-  let warmedUp = false;
+  // ── THE WARM-UP ───────────────────────────────────────────────────────────────
+  // Prove the session FIRST, before the item loop, before any claim, before
+  // any arm-lock write: a session we cannot get then costs nothing, because no
+  // item has been touched and they all stay `approved`.
+  //
+  // Since CR-2026-09-17 this is a CHEAP, refuse-policy check, not a handoff.
+  // The bot never summons a human on its own any more — the keeper reports the
+  // death once, nudges while work waits, and an operator starts the login by
+  // pressing the button on the QR page. A dead session here is therefore not an
+  // error to Slack about: hand it to the keeper and leave the batch untouched.
   try {
-    await withSession(async (_ctx, page) => {
-      // ── THE WARM-UP ─────────────────────────────────────────────────────
-      // Log in FIRST, before the item loop, before any claim, before any
-      // arm-lock write: a scan we cannot get then costs nothing, because no
-      // item has been touched and they all stay `approved`. The login used to
-      // happen lazily inside the first item's gotoAuthenticated, which crashed
-      // whichever item happened to be first (`running`, then `failed`) and left
-      // its conservative arm lock standing for ~10 min.
-      //
-      // This is the ONE queue path allowed to summon a human ("handoff"). The
-      // payroll settlement check that runs after this batch keeps the default
-      // "refuse" — a QR page makes it give up at once into its existing
-      // BANK_CHECK_UNAVAILABLE + 6-hour retry.
-      await ensureLoggedIn(page, { onQr: "handoff", reason: `${approved.length} approved item(s)` });
-      lastLoginFailAt = null;
-      warmedUp = true;
-
-      for (const req of approved) {
-        console.log(`\n=== ${req.id}  (${req.type}) ===`);
-
-        // ── THE GATE ────────────────────────────────────────────────────────
-        // Evaluated BEFORE the `running` claim below, so a held item is never
-        // touched: no ":hourglass: Running", no page, no form, no Next.
-        //
-        // ALL THREE push-arming types go through it. transfer-other arms on
-        // Next; transfer-payroll arms on Confirm; add-payroll arms on Next too
-        // — KBIZ answers it with the review screen that literally says "A
-        // notification has been sent to the K BIZ application", and the flow
-        // then sits in waitForMobileConfirmation for 5 min exactly like the
-        // other two. It moves no money, but it spends the SAME phone and the
-        // same bank-side push, and a money push armed seconds after its tap
-        // raises no banner at all (2026-08-12/13). Only list-favorites and
-        // list-registered are genuinely push-free.
-        let gapMs = 0;
-        if (req.type === "transfer-other" || req.type === "transfer-payroll" || req.type === "add-payroll") {
-          const now = Date.now();
-          const { text, mtimeMs } = readArmLockRaw();
-          const lock = parseArmLock(text, mtimeMs, now);
-          if (lock.live === false && lock.source === "corrupt-unknown") {
-            // Bounded by nothing (no content, no mtime) so we do NOT hold — but
-            // this is the one lock state a human should look at.
-            await notifySlack(
-              `:rotating_light: The KBIZ arm lock is unreadable AND has no mtime — proceeding WITHOUT the one-push-at-a-time guard for \`${req.id}\`. Check /app/data/kbiz-arm-lock.json.`,
-            );
-          }
-          const decision = decideArm({ prev, lock, now, gapMs: TAP_COOLDOWN_MS });
-          if (decision.kind === "defer") {
-            // Terminal status on purpose: a bare `break`/skip would leave the
-            // item `approved` and the 30 s watch loop would re-pick it forever.
-            // `failed` is exactly "nothing moved, retryable by a human" —
-            // reimbursement returns the bundle to APPROVED with paymentError set
-            // and never auto-re-queues it (kbiz-poller.ts).
-            const dest = req.type === "transfer-other" ? describeDestination(req) : req.type;
-            const amount = req.type === "transfer-other" ? req.amount : undefined;
-            const errorText = deferredErrorText(decision, Date.now());
-            // F7: a payroll-type defer must NOT get the transfer-other result
-            // shape (`{outcome, ...}`, no `success` key). PayrollQueueRequest's
-            // result is typed `{success: boolean; ...}` and the status view
-            // branches on `req.result.success` — an omitted key falls to the
-            // failure branch by JS coercion accident, not a real `success:false`.
-            const patch =
-              req.type === "transfer-other"
-                ? mapFlowOutcomeToPatch({ success: false, error: errorText })
-                : { status: "failed" as const, result: { success: false as const, error: errorText } };
-            try {
-              await patchRequest(req.id, { status: patch.status, result: patch.result, completedAt: new Date().toISOString() });
-            } catch (e) {
-              console.log(`↷ ${req.id} deferred but its queue file is gone: ${(e as Error).message}`);
-            }
-            await notifySlack(
-              deferredMessage({ id: req.id, dest, amount, position: positions.get(req.id), decision, now: Date.now() }),
-            );
-            console.log(`⛔ ${req.id} HELD (${decision.code}) — nothing submitted`);
-            // `prev` is deliberately NOT updated: a deferred item armed nothing.
-            continue;
-          }
-          gapMs = decision.gapMs; // 0, or TAP_COOLDOWN_MS after a confirmed success
-        }
-
-        // The claim. listApproved() snapshots the queue up front and each
-        // preceding transfer can wait minutes for a phone tap, so by the time we
-        // get here the file may have been WITHDRAWN (reimbursement's stale-sweep
-        // archives an intent the bot never started). A vanished file is a clean
-        // per-item skip — it must never abort the rest of the batch.
-        try {
-          await patchRequest(req.id, { status: "running", startedAt: new Date().toISOString() });
-        } catch (e) {
-          console.log(`↷ ${req.id} skipped — queue file gone before claim (withdrawn?): ${(e as Error).message}`);
-          continue;
-        }
-        await notifySlack(`:hourglass_flowing_sand: Running \`${req.id}\` (${req.type})`);
-
-        if (req.type === "transfer-other") {
-          // bank + last 4 for a custom destination — a full account number has
-          // no business in Slack. See describeDestination.
-          const dest = describeDestination(req);
-          // The gap is now spent only after an ACTUALLY ARMED previous push
-          // (decideArm returns 0 otherwise) — a payee-handle typo on item 1 no
-          // longer costs item 2 a pointless 90 s.
-          if (gapMs > 0) {
-            await notifySlack(
-              pauseBeforeArmMessage({
-                dest,
-                amount: req.amount,
-                gapSeconds: Math.round(gapMs / 1000),
-                position: positions.get(req.id),
-              }),
-            );
-            await new Promise((r) => setTimeout(r, gapMs));
-          }
-          // Never throws. SPEC REVIEW FINDING 6 (2026-08-19): this comment used
-          // to say the ping "fires at the exact moment Next is clicked (push
-          // armed)" — that stopped being true the moment IMPL-D moved onArmed
-          // to fire only AFTER verifyArmed confirms the bank's own panel (see
-          // the paragraph below); a stale claim on the money-path arm seam is
-          // exactly the kind of thing the next diagnosis would trust.
-          //
-          // The lock refinement is issued SYNCHRONOUSLY right after the Slack
-          // fetch is kicked off, deliberately NOT behind `await notifySlack(…)`:
-          // a hung webhook would otherwise delay this write past the flow's own
-          // release and re-arm an already-dead lock.
-          // `armedAt` is the CLICK time (kbiz-fix-spec.md §1.6/§2.3), not the
-          // moment this callback runs — IMPL-D now fires it only AFTER
-          // verifyArmed confirms the bank's "notification sent" panel, which is
-          // deliberately LATER than the click by design. The lock's window has
-          // to reflect when the push actually started counting down at the
-          // bank, not when we happened to finish confirming it exists.
-          const onArmed = (armedAt: number) => {
-            const posted = notifySlack(
-              tapNeededMessage({ id: req.id, dest, amount: req.amount, position: positions.get(req.id) }),
-            );
-            try {
-              writeArmLock(armedLock(req.id, armedAt));
-            } catch {
-              // Best-effort: the conservative lock written before the flow is
-              // the safety net, and it is already on disk.
-            }
-            return posted;
-          };
-          try {
-            const patch = await runTransferOtherQueueItem(page, req, onArmed);
-            await patchRequest(req.id, { status: patch.status, result: patch.result, completedAt: new Date().toISOString() });
-            const icon = patch.status === "done" ? "✅" : patch.status === "needs-review" ? "⚠️" : "❌";
-            const slackIcon = patch.status === "done" ? ":white_check_mark:" : patch.status === "needs-review" ? ":warning:" : ":x:";
-            const detail = patch.result.error ? ` — ${patch.result.error}` : patch.result.reference ? ` → ${patch.result.reference}` : "";
-            // An unconfirmed exit that left the push TAPPABLE is the one case
-            // where "Retry" is the wrong button — say so on the same line.
-            const liveWarning =
-              patch.result.outcome === "unconfirmed" && patch.pushMayBeLive === true && patch.armedAt !== undefined
-                ? livePushWarning(patch.armedAt + PUSH_LIFETIME_MS)
-                : "";
-            await notifySlack(
-              `${slackIcon} ${patch.status} \`${req.id}\` (transfer-other → ${dest}, bundle ${req.bundleId})${detail}${liveWarning}`,
-            );
-            console.log(`${icon} ${req.id} ${patch.status}`);
-            // What the NEXT money item's gate sees. `armedAt` is the only signal
-            // that separates "never armed" (a pre-flight failure — must not hold
-            // the batch) from "the bank said no" (must).
-            // No cast: patch.result.outcome (the contract's four-way union,
-            // shared/index.ts:549) and PrevMoneyItem's `outcome` (approval-wait
-            // .ts's TransferOutcome) are now the SAME four literal strings, so
-            // this is a structural fit. If this stops typechecking, the two
-            // unions have genuinely diverged — that is a real bug to report,
-            // not a cast to restore (kbiz-fix-spec.md §1.6).
-            prev = patch.armedAt !== undefined
-              ? { kind: "armed", id: req.id, outcome: patch.result.outcome }
-              : { kind: "not-armed", id: req.id };
-          } catch (e) {
-            // Unknown crash: we cannot prove the phone push was never armed, so
-            // this is filed as needs-review (never auto-retried), not failed —
-            // the same "ambiguity is never auto-resolved" rule the flow itself
-            // uses for a timeout. See money-safety invariant 2 in the ADR.
-            //
-            // THE ARM LOCK IS DELIBERATELY NOT RELEASED HERE. A crash after the
-            // Next click cannot prove the push is dead, so the conservative lock
-            // written before the flow stands until it expires (≤10.5 min) and
-            // every later item — this batch or the next poll — is held.
-            const error = (e as Error).message;
-            const patch = mapFlowOutcomeToPatch({ success: false, outcome: "unconfirmed", error: `Crashed: ${error}` });
-            await patchRequest(req.id, { status: patch.status, result: patch.result, completedAt: new Date().toISOString() });
-            await notifySlack(
-              `:warning: Crashed \`${req.id}\` (transfer-other → ${dest}, bundle ${req.bundleId}) → needs-review — ${error}`,
-            );
-            console.log(`⚠️ ${req.id} crashed → needs-review: ${error}`);
-            // Treated as ARMED + unconfirmed: a crash cannot prove otherwise,
-            // so the rest of the batch is held (belt to the lock's braces).
-            prev = { kind: "armed", id: req.id, outcome: "unconfirmed" };
-          }
-          continue;
-        }
-
-        // A read-only scrape: nothing can move, so a failure is always just
-        // "failed" (retryable), never the ambiguous needs-review a transfer has.
-        if (req.type === "list-favorites") {
-          // The completion patch may find the file GONE (reimbursement's
-          // staleness sweep can archive an old ask) — the scrape's real output
-          // is kbiz-favorites.json, which was already published, so a vanished
-          // status file is a shrug, never a batch-abort.
-          try {
-            const count = await runListFavorites(page);
-            await patchRequest(req.id, {
-              status: "done",
-              completedAt: new Date().toISOString(),
-              result: { success: true, count },
-            }).catch((e) =>
-              console.log(`↷ ${req.id} finished but its queue file is gone (${(e as Error).message}) — manifest published anyway`),
-            );
-            await notifySlack(`:white_check_mark: Done \`${req.id}\` (list-favorites) → ${count} saved account(s)`);
-            console.log(`✅ ${req.id} done`);
-          } catch (e) {
-            const error = (e as Error).message;
-            await patchRequest(req.id, {
-              status: "failed",
-              completedAt: new Date().toISOString(),
-              result: { success: false, error },
-            }).catch(() => console.log(`↷ ${req.id} failed and its queue file is gone`));
-            await notifySlack(`:x: Failed \`${req.id}\` (list-favorites) — ${error}`);
-            console.log(`❌ ${req.id} failed: ${error}`);
-          }
-          continue;
-        }
-
-        // list-registered has no workbook (xlsxPath is "")
-        const xlsxAbs = req.xlsxPath.startsWith("data/") ? resolve("..", req.xlsxPath) : resolve(req.xlsxPath);
-
-        // transfer-payroll AND add-payroll both ARM A PHONE PUSH (Confirm →
-        // waitForMobileConfirmation, and Next → the "notification has been sent"
-        // review screen → waitForMobileConfirmation, respectively), so both take
-        // the same estate-wide lock as a transfer-other. Fail closed exactly the
-        // same way: no lock, no push. list-registered arms nothing and takes no
-        // lock.
-        let pushLock: ArmLock | undefined;
-        if (req.type === "transfer-payroll" || req.type === "add-payroll") {
-          // F4: the same deliberate gap + operator warning the transfer-other
-          // branch spends above — `gapMs` was already decided by THE GATE for
-          // every gated type, but only transfer-other used to read it, so a
-          // payroll item following an armed push used to arm seconds after the
-          // previous tap with no pause and no "background the app" warning. A
-          // payroll workbook has no single amount to name, so the pause message
-          // names the request type in place of ฿amount → dest.
-          if (gapMs > 0) {
-            await notifySlack(
-              pauseBeforeArmMessage({ dest: req.type, gapSeconds: Math.round(gapMs / 1000), position: positions.get(req.id) }),
-            );
-            await new Promise((r) => setTimeout(r, gapMs));
-          }
-          const candidate = conservativeLock(req.id, Date.now());
-          try {
-            writeArmLock(candidate);
-            pushLock = candidate;
-          } catch (e) {
-            const error = `Could not record the arm lock (${(e as Error).message}) — refusing to arm.`;
-            await patchRequest(req.id, {
-              status: "failed",
-              completedAt: new Date().toISOString(),
-              result: { success: false, error },
-            }).catch(() => console.log(`↷ ${req.id} failed and its queue file is gone`));
-            await notifySlack(`:x: Failed \`${req.id}\` (${req.type}) — ${error}`);
-            console.log(`❌ ${req.id} failed: ${error}`);
-            continue;
-          }
-        }
-
-        try {
-          const result =
-            req.type === "list-registered"
-              ? await runListRegistered(page)
-              : req.type === "transfer-payroll"
-                ? await runTransferPayrollFlow(page, xlsxAbs)
-                : await runAddPayrollFlow(page, xlsxAbs);
-
-          // RELEASE, only on a PROVABLY DEAD outcome — the same rule
-          // runTransferOtherQueueItem uses, expressed through the same
-          // `pushMayBeLive` flag.
-          //
-          // Payroll succeeds only on the bank's expected confirmation page.
-          // An auth/error redirect sets pushMayBeLive because it proves neither
-          // acceptance nor a dead push. Pre-Confirm refusals remain never armed.
-          // Add-payroll also sets the flag when neither a rejection popup nor
-          // the notification screen appears after Next.
-          // The `catch` below deliberately releases nothing: a throw (including
-          // a 5-minute waitForMobileConfirmation timeout) cannot prove the push
-          // is dead, so the conservative lock stands until it expires.
-          const pushMayBeLive = "pushMayBeLive" in result && result.pushMayBeLive === true;
-          if (pushLock && !pushMayBeLive) {
-            try {
-              writeArmLock(releasedLock(pushLock, result.success ? "success" : "confirmed-failed", Date.now()));
-            } catch (e) {
-              console.warn(`⚠ could not release the arm lock for ${req.id}: ${(e as Error).message}`);
-            }
-          }
-
-          if (result.success) {
-            await patchRequest(req.id, {
-              status: "done",
-              completedAt: new Date().toISOString(),
-              result: { success: true, finalUrl: result.finalUrl, ...("bankReferenceNo" in result ? { bankReferenceNo: result.bankReferenceNo } : {}) },
-            });
-            await notifySlack(`:white_check_mark: Done \`${req.id}\` (${req.type}) → ${result.finalUrl}`);
-            console.log(`✅ ${req.id} done`);
-          } else {
-            await patchRequest(req.id, {
-              status: "failed",
-              completedAt: new Date().toISOString(),
-              result: { success: false, error: result.error },
-            });
-            await notifySlack(`:x: Failed \`${req.id}\` (${req.type}) — ${result.error}`);
-            console.log(`❌ ${req.id} failed: ${result.error}`);
-          }
-          // F4: what the NEXT money item's gate sees — mirrors the assignment
-          // in the transfer-other branch above. list-registered arms nothing,
-          // so it must never touch `prev`. `pushMayBeLive` is the only signal
-          // (for BOTH flows — see the comment above) that separates "never
-          // armed" from "armed but unresolved". An uncertain payroll redirect
-          // must hold later pushes just like an uncertain add-payroll result.
-          if (pushLock) {
-            prev = result.success
-              ? { kind: "armed", id: req.id, outcome: "success" }
-              : pushMayBeLive
-                ? { kind: "armed", id: req.id, outcome: "unconfirmed" }
-                : { kind: "not-armed", id: req.id };
-          }
-        } catch (e) {
-          // A transfer-payroll / add-payroll crash leaves its arm lock STANDING
-          // on purpose — see the release above.
-          const error = (e as Error).message;
-          await patchRequest(req.id, {
-            status: "failed",
-            completedAt: new Date().toISOString(),
-            result: { success: false, error },
-          });
-          await notifySlack(`:x: Crashed \`${req.id}\` (${req.type}) — ${error}`);
-          console.log(`❌ ${req.id} crashed: ${error}`);
-          // F4: same as the transfer-other crash handler — cannot prove the
-          // push is dead, so the rest of the batch is held (belt to the lock's
-          // braces). list-registered never took a lock, so never touches prev.
-          if (pushLock) prev = { kind: "armed", id: req.id, outcome: "unconfirmed" };
-        }
-      }
-    });
+    await ensureLoggedIn(page);
   } catch (e) {
-    // A throw AFTER the warm-up is an item-level problem the item loop has
-    // already reported — pass it straight on, exactly as before.
-    if (warmedUp) throw e;
-    // We never had a session: nobody scanned, or the login failed for another
-    // reason (a wrong password, a bank outage, "After re-login still
-    // bouncing") — including Chromium failing to launch, which happens inside
-    // withSession before the callback above ever runs. Nothing was claimed, so
-    // the batch would otherwise sit at `approved` forever with the failure
-    // visible only in a container log nobody reads. The cooldown rate-limits
-    // this to one line per 10 min.
-    lastLoginFailAt = Date.now();
-    if (e instanceof QrLoginTimeoutError) {
-      // The contract's Thai line, and no rethrow: the items are untouched and
-      // the next ask is bounded by the cooldown.
-      await notifySlack(qrTimeoutMessage());
-      console.log(`⛔ no K BIZ QR scan — ${approved.length} request(s) left approved, retrying in 10 min`);
-      return approved.length;
-    }
-    // English (the contract fixes Thai copy for its three defined lines only)
-    // and masked — an error string can carry the bank's `loginQR.do?cmd=<token>`.
-    await notifySlack(
+    // MASKED, like every other note that reaches session.json: this string is
+    // published to the Cloudflare-gated operator page, and a raw Playwright
+    // error carries a multi-line call log plus the bank's own
+    // `loginQR.do?cmd=<session token>` URL.
+    hooks.onSessionDead?.({
+      note: maskedNote(`warm-up failed: ${(e as Error).message}`),
+      unclassified: !isSessionDeathError(e),
+    });
+    console.log(
       maskQrMessage(
-        `:x: kbiz-bot: K BIZ login failed (${approved.length} approved item(s)) — ` +
-          `${(e as Error).message}; retrying in 10 min`,
+        `⏸ ${approved.length} approved request(s) held — no K BIZ session (${(e as Error).message})`,
       ),
     );
-    throw e;
+    return approved.length;
   }
+
+  for (const req of approved) {
+    console.log(`\n=== ${req.id}  (${req.type}) ===`);
+
+    // ── THE GATE ────────────────────────────────────────────────────────
+    // Evaluated BEFORE the `running` claim below, so a held item is never
+    // touched: no ":hourglass: Running", no page, no form, no Next.
+    //
+    // ALL THREE push-arming types go through it. transfer-other arms on
+    // Next; transfer-payroll arms on Confirm; add-payroll arms on Next too
+    // — KBIZ answers it with the review screen that literally says "A
+    // notification has been sent to the K BIZ application", and the flow
+    // then sits in waitForMobileConfirmation for 5 min exactly like the
+    // other two. It moves no money, but it spends the SAME phone and the
+    // same bank-side push, and a money push armed seconds after its tap
+    // raises no banner at all (2026-08-12/13). Only list-favorites and
+    // list-registered are genuinely push-free.
+    let gapMs = 0;
+    if (req.type === "transfer-other" || req.type === "transfer-payroll" || req.type === "add-payroll") {
+      const now = Date.now();
+      const { text, mtimeMs } = readArmLockRaw();
+      const lock = parseArmLock(text, mtimeMs, now);
+      if (lock.live === false && lock.source === "corrupt-unknown") {
+        // Bounded by nothing (no content, no mtime) so we do NOT hold — but
+        // this is the one lock state a human should look at.
+        await notifySlack(
+          `:rotating_light: The KBIZ arm lock is unreadable AND has no mtime — proceeding WITHOUT the one-push-at-a-time guard for \`${req.id}\`. Check /app/data/kbiz-arm-lock.json.`,
+        );
+      }
+      const decision = decideArm({ prev, lock, now, gapMs: TAP_COOLDOWN_MS });
+      if (decision.kind === "defer") {
+        // Terminal status on purpose: a bare `break`/skip would leave the
+        // item `approved` and the 30 s watch loop would re-pick it forever.
+        // `failed` is exactly "nothing moved, retryable by a human" —
+        // reimbursement returns the bundle to APPROVED with paymentError set
+        // and never auto-re-queues it (kbiz-poller.ts).
+        const dest = req.type === "transfer-other" ? describeDestination(req) : req.type;
+        const amount = req.type === "transfer-other" ? req.amount : undefined;
+        const errorText = deferredErrorText(decision, Date.now());
+        // F7: a payroll-type defer must NOT get the transfer-other result
+        // shape (`{outcome, ...}`, no `success` key). PayrollQueueRequest's
+        // result is typed `{success: boolean; ...}` and the status view
+        // branches on `req.result.success` — an omitted key falls to the
+        // failure branch by JS coercion accident, not a real `success:false`.
+        const patch =
+          req.type === "transfer-other"
+            ? mapFlowOutcomeToPatch({ success: false, error: errorText })
+            : { status: "failed" as const, result: { success: false as const, error: errorText } };
+        try {
+          await patchRequest(req.id, { status: patch.status, result: patch.result, completedAt: new Date().toISOString() });
+        } catch (e) {
+          console.log(`↷ ${req.id} deferred but its queue file is gone: ${(e as Error).message}`);
+        }
+        await notifySlack(
+          deferredMessage({ id: req.id, dest, amount, position: positions.get(req.id), decision, now: Date.now() }),
+        );
+        console.log(`⛔ ${req.id} HELD (${decision.code}) — nothing submitted`);
+        // `prev` is deliberately NOT updated: a deferred item armed nothing.
+        continue;
+      }
+      gapMs = decision.gapMs; // 0, or TAP_COOLDOWN_MS after a confirmed success
+    }
+
+    // The claim. listApproved() snapshots the queue up front and each
+    // preceding transfer can wait minutes for a phone tap, so by the time we
+    // get here the file may have been WITHDRAWN (reimbursement's stale-sweep
+    // archives an intent the bot never started). A vanished file is a clean
+    // per-item skip — it must never abort the rest of the batch.
+    try {
+      await patchRequest(req.id, { status: "running", startedAt: new Date().toISOString() });
+    } catch (e) {
+      console.log(`↷ ${req.id} skipped — queue file gone before claim (withdrawn?): ${(e as Error).message}`);
+      continue;
+    }
+    await notifySlack(`:hourglass_flowing_sand: Running \`${req.id}\` (${req.type})`);
+
+    if (req.type === "transfer-other") {
+      // bank + last 4 for a custom destination — a full account number has
+      // no business in Slack. See describeDestination.
+      const dest = describeDestination(req);
+      // The gap is now spent only after an ACTUALLY ARMED previous push
+      // (decideArm returns 0 otherwise) — a payee-handle typo on item 1 no
+      // longer costs item 2 a pointless 90 s.
+      if (gapMs > 0) {
+        await notifySlack(
+          pauseBeforeArmMessage({
+            dest,
+            amount: req.amount,
+            gapSeconds: Math.round(gapMs / 1000),
+            position: positions.get(req.id),
+          }),
+        );
+        await new Promise((r) => setTimeout(r, gapMs));
+      }
+      // Never throws. SPEC REVIEW FINDING 6 (2026-08-19): this comment used
+      // to say the ping "fires at the exact moment Next is clicked (push
+      // armed)" — that stopped being true the moment IMPL-D moved onArmed
+      // to fire only AFTER verifyArmed confirms the bank's own panel (see
+      // the paragraph below); a stale claim on the money-path arm seam is
+      // exactly the kind of thing the next diagnosis would trust.
+      //
+      // The lock refinement is issued SYNCHRONOUSLY right after the Slack
+      // fetch is kicked off, deliberately NOT behind `await notifySlack(…)`:
+      // a hung webhook would otherwise delay this write past the flow's own
+      // release and re-arm an already-dead lock.
+      // `armedAt` is the CLICK time (kbiz-fix-spec.md §1.6/§2.3), not the
+      // moment this callback runs — IMPL-D now fires it only AFTER
+      // verifyArmed confirms the bank's "notification sent" panel, which is
+      // deliberately LATER than the click by design. The lock's window has
+      // to reflect when the push actually started counting down at the
+      // bank, not when we happened to finish confirming it exists.
+      const onArmed = (armedAt: number) => {
+        const posted = notifySlack(
+          tapNeededMessage({ id: req.id, dest, amount: req.amount, position: positions.get(req.id) }),
+        );
+        try {
+          writeArmLock(armedLock(req.id, armedAt));
+        } catch {
+          // Best-effort: the conservative lock written before the flow is
+          // the safety net, and it is already on disk.
+        }
+        return posted;
+      };
+      try {
+        const patch = await runTransferOtherQueueItem(page, req, onArmed);
+        await patchRequest(req.id, { status: patch.status, result: patch.result, completedAt: new Date().toISOString() });
+        const icon = patch.status === "done" ? "✅" : patch.status === "needs-review" ? "⚠️" : "❌";
+        const slackIcon = patch.status === "done" ? ":white_check_mark:" : patch.status === "needs-review" ? ":warning:" : ":x:";
+        const detail = patch.result.error ? ` — ${patch.result.error}` : patch.result.reference ? ` → ${patch.result.reference}` : "";
+        // An unconfirmed exit that left the push TAPPABLE is the one case
+        // where "Retry" is the wrong button — say so on the same line.
+        const liveWarning =
+          patch.result.outcome === "unconfirmed" && patch.pushMayBeLive === true && patch.armedAt !== undefined
+            ? livePushWarning(patch.armedAt + PUSH_LIFETIME_MS)
+            : "";
+        await notifySlack(
+          `${slackIcon} ${patch.status} \`${req.id}\` (transfer-other → ${dest}, bundle ${req.bundleId})${detail}${liveWarning}`,
+        );
+        console.log(`${icon} ${req.id} ${patch.status}`);
+        // What the NEXT money item's gate sees. `armedAt` is the only signal
+        // that separates "never armed" (a pre-flight failure — must not hold
+        // the batch) from "the bank said no" (must).
+        // No cast: patch.result.outcome (the contract's four-way union,
+        // shared/index.ts:549) and PrevMoneyItem's `outcome` (approval-wait
+        // .ts's TransferOutcome) are now the SAME four literal strings, so
+        // this is a structural fit. If this stops typechecking, the two
+        // unions have genuinely diverged — that is a real bug to report,
+        // not a cast to restore (kbiz-fix-spec.md §1.6).
+        prev = patch.armedAt !== undefined
+          ? { kind: "armed", id: req.id, outcome: patch.result.outcome }
+          : { kind: "not-armed", id: req.id };
+      } catch (e) {
+        // Unknown crash: we cannot prove the phone push was never armed, so
+        // this is filed as needs-review (never auto-retried), not failed —
+        // the same "ambiguity is never auto-resolved" rule the flow itself
+        // uses for a timeout. See money-safety invariant 2 in the ADR.
+        //
+        // THE ARM LOCK IS DELIBERATELY NOT RELEASED HERE. A crash after the
+        // Next click cannot prove the push is dead, so the conservative lock
+        // written before the flow stands until it expires (≤10.5 min) and
+        // every later item — this batch or the next poll — is held.
+        const error = (e as Error).message;
+        const patch = mapFlowOutcomeToPatch({ success: false, outcome: "unconfirmed", error: `Crashed: ${error}` });
+        await patchRequest(req.id, { status: patch.status, result: patch.result, completedAt: new Date().toISOString() });
+        await notifySlack(
+          `:warning: Crashed \`${req.id}\` (transfer-other → ${dest}, bundle ${req.bundleId}) → needs-review — ${error}`,
+        );
+        console.log(`⚠️ ${req.id} crashed → needs-review: ${error}`);
+        // Treated as ARMED + unconfirmed: a crash cannot prove otherwise,
+        // so the rest of the batch is held (belt to the lock's braces).
+        prev = { kind: "armed", id: req.id, outcome: "unconfirmed" };
+      }
+      continue;
+    }
+
+    // A read-only scrape: nothing can move, so a failure is always just
+    // "failed" (retryable), never the ambiguous needs-review a transfer has.
+    if (req.type === "list-favorites") {
+      // The completion patch may find the file GONE (reimbursement's
+      // staleness sweep can archive an old ask) — the scrape's real output
+      // is kbiz-favorites.json, which was already published, so a vanished
+      // status file is a shrug, never a batch-abort.
+      try {
+        const count = await runListFavorites(page);
+        await patchRequest(req.id, {
+          status: "done",
+          completedAt: new Date().toISOString(),
+          result: { success: true, count },
+        }).catch((e) =>
+          console.log(`↷ ${req.id} finished but its queue file is gone (${(e as Error).message}) — manifest published anyway`),
+        );
+        await notifySlack(`:white_check_mark: Done \`${req.id}\` (list-favorites) → ${count} saved account(s)`);
+        console.log(`✅ ${req.id} done`);
+      } catch (e) {
+        const error = (e as Error).message;
+        await patchRequest(req.id, {
+          status: "failed",
+          completedAt: new Date().toISOString(),
+          result: { success: false, error },
+        }).catch(() => console.log(`↷ ${req.id} failed and its queue file is gone`));
+        await notifySlack(`:x: Failed \`${req.id}\` (list-favorites) — ${error}`);
+        console.log(`❌ ${req.id} failed: ${error}`);
+      }
+      continue;
+    }
+
+    // list-registered has no workbook (xlsxPath is "")
+    const xlsxAbs = req.xlsxPath.startsWith("data/") ? resolve("..", req.xlsxPath) : resolve(req.xlsxPath);
+
+    // transfer-payroll AND add-payroll both ARM A PHONE PUSH (Confirm →
+    // waitForMobileConfirmation, and Next → the "notification has been sent"
+    // review screen → waitForMobileConfirmation, respectively), so both take
+    // the same estate-wide lock as a transfer-other. Fail closed exactly the
+    // same way: no lock, no push. list-registered arms nothing and takes no
+    // lock.
+    let pushLock: ArmLock | undefined;
+    if (req.type === "transfer-payroll" || req.type === "add-payroll") {
+      // F4: the same deliberate gap + operator warning the transfer-other
+      // branch spends above — `gapMs` was already decided by THE GATE for
+      // every gated type, but only transfer-other used to read it, so a
+      // payroll item following an armed push used to arm seconds after the
+      // previous tap with no pause and no "background the app" warning. A
+      // payroll workbook has no single amount to name, so the pause message
+      // names the request type in place of ฿amount → dest.
+      if (gapMs > 0) {
+        await notifySlack(
+          pauseBeforeArmMessage({ dest: req.type, gapSeconds: Math.round(gapMs / 1000), position: positions.get(req.id) }),
+        );
+        await new Promise((r) => setTimeout(r, gapMs));
+      }
+      const candidate = conservativeLock(req.id, Date.now());
+      try {
+        writeArmLock(candidate);
+        pushLock = candidate;
+      } catch (e) {
+        const error = `Could not record the arm lock (${(e as Error).message}) — refusing to arm.`;
+        await patchRequest(req.id, {
+          status: "failed",
+          completedAt: new Date().toISOString(),
+          result: { success: false, error },
+        }).catch(() => console.log(`↷ ${req.id} failed and its queue file is gone`));
+        await notifySlack(`:x: Failed \`${req.id}\` (${req.type}) — ${error}`);
+        console.log(`❌ ${req.id} failed: ${error}`);
+        continue;
+      }
+    }
+
+    try {
+      const result =
+        req.type === "list-registered"
+          ? await runListRegistered(page)
+          : req.type === "transfer-payroll"
+            ? await runTransferPayrollFlow(page, xlsxAbs)
+            : await runAddPayrollFlow(page, xlsxAbs);
+
+      // RELEASE, only on a PROVABLY DEAD outcome — the same rule
+      // runTransferOtherQueueItem uses, expressed through the same
+      // `pushMayBeLive` flag.
+      //
+      // Payroll succeeds only on the bank's expected confirmation page.
+      // An auth/error redirect sets pushMayBeLive because it proves neither
+      // acceptance nor a dead push. Pre-Confirm refusals remain never armed.
+      // Add-payroll also sets the flag when neither a rejection popup nor
+      // the notification screen appears after Next.
+      // The `catch` below deliberately releases nothing: a throw (including
+      // a 5-minute waitForMobileConfirmation timeout) cannot prove the push
+      // is dead, so the conservative lock stands until it expires.
+      const pushMayBeLive = "pushMayBeLive" in result && result.pushMayBeLive === true;
+      if (pushLock && !pushMayBeLive) {
+        try {
+          writeArmLock(releasedLock(pushLock, result.success ? "success" : "confirmed-failed", Date.now()));
+        } catch (e) {
+          console.warn(`⚠ could not release the arm lock for ${req.id}: ${(e as Error).message}`);
+        }
+      }
+
+      if (result.success) {
+        await patchRequest(req.id, {
+          status: "done",
+          completedAt: new Date().toISOString(),
+          result: { success: true, finalUrl: result.finalUrl, ...("bankReferenceNo" in result ? { bankReferenceNo: result.bankReferenceNo } : {}) },
+        });
+        await notifySlack(`:white_check_mark: Done \`${req.id}\` (${req.type}) → ${result.finalUrl}`);
+        console.log(`✅ ${req.id} done`);
+      } else {
+        await patchRequest(req.id, {
+          status: "failed",
+          completedAt: new Date().toISOString(),
+          result: { success: false, error: result.error },
+        });
+        await notifySlack(`:x: Failed \`${req.id}\` (${req.type}) — ${result.error}`);
+        console.log(`❌ ${req.id} failed: ${result.error}`);
+      }
+      // F4: what the NEXT money item's gate sees — mirrors the assignment
+      // in the transfer-other branch above. list-registered arms nothing,
+      // so it must never touch `prev`. `pushMayBeLive` is the only signal
+      // (for BOTH flows — see the comment above) that separates "never
+      // armed" from "armed but unresolved". An uncertain payroll redirect
+      // must hold later pushes just like an uncertain add-payroll result.
+      if (pushLock) {
+        prev = result.success
+          ? { kind: "armed", id: req.id, outcome: "success" }
+          : pushMayBeLive
+            ? { kind: "armed", id: req.id, outcome: "unconfirmed" }
+            : { kind: "not-armed", id: req.id };
+      }
+    } catch (e) {
+      // A transfer-payroll / add-payroll crash leaves its arm lock STANDING
+      // on purpose — see the release above.
+      const error = (e as Error).message;
+      await patchRequest(req.id, {
+        status: "failed",
+        completedAt: new Date().toISOString(),
+        result: { success: false, error },
+      });
+      await notifySlack(`:x: Crashed \`${req.id}\` (${req.type}) — ${error}`);
+      console.log(`❌ ${req.id} crashed: ${error}`);
+      // F4: same as the transfer-other crash handler — cannot prove the
+      // push is dead, so the rest of the batch is held (belt to the lock's
+      // braces). list-registered never took a lock, so never touches prev.
+      if (pushLock) prev = { kind: "armed", id: req.id, outcome: "unconfirmed" };
+    }
+  }
+
   return approved.length;
+}
+
+// ── The resident loop ────────────────────────────────────────
+
+/** Where the operator presses the button. Same env the QR driver reads. */
+const QR_PAGE_URL = process.env.KBIZ_QR_PAGE_URL ?? DEFAULT_QR_PAGE_URL;
+
+/** A positive number of milliseconds, or the default — an empty, unparseable
+ *  or zero/negative override must never turn a cadence into a tight loop. */
+function positiveMs(raw: string | undefined, fallback: number): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function keeperConfig(): KeeperConfig {
+  return {
+    tickMs: positiveMs(process.env.KBIZ_TICK_MS, DEFAULT_TICK_MS),
+    keepaliveMs: positiveMs(process.env.KBIZ_KEEPALIVE_MS, DEFAULT_KEEPALIVE_MS),
+    // The queue keeps its own env var and its own 30 s default, unchanged.
+    queuePollMs: positiveMs(process.env.QUEUE_POLL_MS, DEFAULT_QUEUE_POLL_MS),
+    reminderMinuteOfDay: parseReminderHhmm(process.env.KBIZ_LOGIN_REMINDER_HHMM ?? DEFAULT_REMINDER_HHMM),
+  };
 }
 
 async function main() {
   const watch = process.argv.includes("--watch");
-  const intervalMs = Number(process.env.QUEUE_POLL_MS ?? 30_000);
 
   if (!watch) {
+    // The one-shot path. No browser unless there is something to do with it
+    // (an empty queue still costs no Chromium launch, exactly as before), and
+    // the SAME refuse-policy warm-up the watch loop runs — no script asks for a
+    // QR scan on its own any more; `npm run login` is the operator's handoff,
+    // and the page's button is production's.
     await publishPayeeHandles(QUEUE_DIR);
-    const n = await processBatch();
-    if (n === 0) console.log("No approved requests in queue.");
-    await checkPayrollBankSettlements(QUEUE_DIR);
+    if ((await listApproved()).length === 0) {
+      console.log("No approved requests in queue.");
+      // Its own `withSession`, and only if it finds a run that is actually due.
+      await checkPayrollBankSettlements(QUEUE_DIR);
+      return;
+    }
+    const oneShot = createSessionKeeper();
+    await oneShot.open();
+    try {
+      await processBatch(oneShot.page());
+      await checkPayrollBankSettlements(QUEUE_DIR, new Date(), { page: oneShot.page() });
+    } finally {
+      await oneShot.close();
+    }
     return;
   }
 
-  console.log(`Watching ${resolve(QUEUE_DIR)} — polling every ${intervalMs}ms. Ctrl+C to stop.`);
-  // First pass immediately
-  await publishPayeeHandles(QUEUE_DIR);
-  await processBatch().catch((e) => console.error("batch error:", (e as Error).message));
-  await checkPayrollBankSettlements(QUEUE_DIR).catch(() => console.warn("Payroll bank status check unavailable."));
-  // Then loop
-  while (true) {
-    await new Promise((r) => setTimeout(r, intervalMs));
+  // ONE persistent context for the whole process (CR-2026-09-17). Deliberately
+  // no SIGTERM/SIGINT handler of our own: playwright already closes the browser
+  // on `docker stop`, and a second handler would race it for the same context.
+  const keeper = createSessionKeeper();
+
+  const config = keeperConfig();
+  const tickMs = config.tickMs;
+  // Seeded, not bare: `lastReminderDay` lives only in memory, so a process that
+  // starts after 08:30 Bangkok on a logged-out day would otherwise post the
+  // sunrise line at 14:00 — and again at every later restart that day.
+  let state: KeeperState = seedReminderDay(initialKeeperState(), Date.now(), config);
+  /** Approved items as of the last queue step — what the nudge counts. */
+  let approvedCount = 0;
+  /** A QR handoff owns the single page while it runs. */
+  let handoffInProgress = false;
+
+  /** Publish what we know. Never throws: a full disk must not take the loop
+   *  down, and the page degrades to its "no session info" state on its own. */
+  const publish = () => {
     try {
-      // mtime-gated: republishes only when the payee book changed, so editing
-      // it on the host reaches the admin dropdown within one poll interval.
-      await publishPayeeHandles(QUEUE_DIR);
-      await processBatch();
-      await checkPayrollBankSettlements(QUEUE_DIR).catch(() => console.warn("Payroll bank status check unavailable."));
+      writeSessionFile(sessionFileFrom(state));
     } catch (e) {
-      console.error("batch error:", (e as Error).message);
+      console.warn(`⚠ could not write session.json: ${(e as Error).message}`);
     }
+  };
+
+  const post = async (action: KeeperAction, pending: number = approvedCount) => {
+    const line = keeperSlackLine(action, {
+      pageUrl: QR_PAGE_URL,
+      lifetimeMs: state.lastLifetimeMs,
+      pending,
+    });
+    if (line) await notifySlack(line);
+  };
+
+  /** Fold a bank round-trip into the state, publish it, and say the one thing
+   *  a death is allowed to say (once). */
+  const applyCheck = async (result: KeeperCheckResult, nowMs: number = Date.now()) => {
+    const folded = applyCheckResult(state, {
+      nowMs,
+      alive: result.alive,
+      note: result.note,
+      unclassified: result.unclassified,
+    });
+    state = folded.state;
+    publish();
+    for (const action of folded.actions) await post(action);
+  };
+
+  /**
+   * The 30 s queue step: handles, the batch (only on a live session), the
+   * pending count both the nudge and `session.json` read, and — still only on
+   * a live session — the read-only payroll settlement check, now on the
+   * keeper's page instead of a second browser of its own.
+   */
+  const runQueueStep = async () => {
+    await publishPayeeHandles(QUEUE_DIR).catch((e) =>
+      console.warn(`⚠ could not publish payee handles: ${(e as Error).message}`),
+    );
+
+    if (isAlive(state)) {
+      // The warm-up reports a dead session through this hook instead of
+      // throwing: the items stay `approved` and untouched either way.
+      const dead: { report: SessionDeadReport | null } = { report: null };
+      await processBatch(keeper.page(), {
+        onSessionDead: (report) => {
+          dead.report = report;
+        },
+      });
+      if (dead.report !== null) {
+        await applyCheck({ alive: false, note: dead.report.note, unclassified: dead.report.unclassified });
+      }
+    }
+
+    approvedCount = (await listApproved()).length;
+    if (approvedCount !== state.pending) {
+      state = setPending(state, approvedCount);
+      publish();
+    }
+
+    if (isAlive(state)) {
+      await checkPayrollBankSettlements(QUEUE_DIR, new Date(), { page: keeper.page() }).catch(() =>
+        console.warn("Payroll bank status check unavailable."),
+      );
+    }
+  };
+
+  const tick = async () => {
+    const nowMs = Date.now();
+    const request = readLoginRequest();
+    const decided = decideTick(
+      state,
+      {
+        nowMs,
+        alive: isAlive(state),
+        requestPresent: request !== null,
+        handoffInProgress,
+        approvedCount,
+        browserOpen: keeper.isOpen(),
+      },
+      config,
+    );
+    state = decided.state;
+    // The count `decideTick` decided with — and stamped into `lastNudgeCount`.
+    // `runQueueStep` refreshes `approvedCount` further down the SAME action
+    // array, so posting the fresh number against a stamp of the stale one would
+    // make the next tick see a "changed" count and repeat the identical line
+    // 5 s later (or name work that was withdrawn during the step).
+    const nudgeCount = approvedCount;
+
+    for (const action of decided.actions) {
+      switch (action) {
+        case "reopen-browser": {
+          console.log("↻ K BIZ browser context is gone — reopening it");
+          try {
+            await keeper.reopen();
+            state = markReopened(withNote(state, "browser restarted"), true);
+          } catch (e) {
+            // A launch can fail for reasons a retry will not fix in 5 s (a
+            // profile lock held by a stray `npm run login`, no disk, no
+            // /dev/shm). The reducer backs the next attempt off — one tick,
+            // then 2, 4, 8 … up to the keepalive interval — instead of
+            // launching Chromium 12×/min forever. Nothing else runs this tick:
+            // every remaining action needs the page we just failed to get.
+            console.warn(`⚠ could not reopen the K BIZ browser: ${(e as Error).message}`);
+            state = markReopened(withNote(state, maskedNote(`browser unavailable: ${(e as Error).message}`)), false);
+            publish();
+            return;
+          }
+          publish();
+          break;
+        }
+        case "claim-and-login": {
+          // CLAIM BEFORE THE BANK IS TOUCHED — the same rule
+          // payroll-bank-backfill.ts follows: a crash, an outage or an
+          // unscanned QR can never turn one press of the button into an
+          // endless retry loop. A rename that finds nothing (the file vanished
+          // between the read and here) is simply not our request.
+          if (!claimLoginRequest()) break;
+          const by = request?.by ?? "unknown";
+          console.log(`→ K BIZ login requested by ${by}`);
+          handoffInProgress = true;
+          let result: KeeperCheckResult;
+          try {
+            result = await keeper.login(`login requested by ${by}`);
+          } finally {
+            handoffInProgress = false;
+          }
+          await applyCheck(result);
+          // The handoff posts its own :lock:/:white_check_mark: lines; these
+          // two are the cases it has nothing to say about.
+          if (result.alreadyAlive) await notifySlack(sessionAliveMessage());
+          else if (result.timedOut) await notifySlack(qrTimeoutMessage());
+          break;
+        }
+        case "keepalive-check": {
+          await applyCheck(await keeper.check());
+          break;
+        }
+        case "run-queue": {
+          await runQueueStep();
+          // Restamp on COMPLETION: a batch can sit on a phone tap for minutes,
+          // and the next tick should not poll again the instant it returns.
+          state = markQueueRan(state, Date.now());
+          break;
+        }
+        case "nudge": {
+          await post(action, nudgeCount);
+          break;
+        }
+        case "reminder": {
+          await post(action);
+          break;
+        }
+        case "session-ended": {
+          // applyCheckResult owns this one; decideTick never emits it.
+          break;
+        }
+      }
+    }
+  };
+
+  console.log(
+    `Watching ${resolve(QUEUE_DIR)} — tick ${tickMs}ms, keepalive ${config.keepaliveMs}ms, ` +
+      `queue ${config.queuePollMs}ms. Ctrl+C to stop.`,
+  );
+  // The startup launch is allowed to FAIL. The pre-CR watch loop survived one
+  // (it caught inside processBatch and retried at the next poll); exiting here
+  // instead would crash-loop the container and publish nothing at all, so the
+  // operator page would show no session info rather than a dead session. On a
+  // failure we say so in `session.json` and fall into the tick loop, which
+  // emits `reopen-browser` (with backoff) and recovers on its own.
+  try {
+    await keeper.open();
+  } catch (e) {
+    console.error(`❌ could not open the K BIZ browser: ${(e as Error).message}`);
+    state = markReopened(withNote(state, maskedNote(`browser unavailable: ${(e as Error).message}`)), false);
+    publish();
+  }
+
+  // The first check publishes session.json within a tick of startup, so the
+  // operator page stops guessing the moment the container is up.
+  if (keeper.isOpen()) await applyCheck(await keeper.check());
+
+  while (true) {
+    try {
+      await tick();
+    } catch (e) {
+      console.error("tick error:", (e as Error).message);
+    }
+    await new Promise((r) => setTimeout(r, tickMs));
   }
 }
 

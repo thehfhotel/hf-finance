@@ -19,7 +19,13 @@ import { CardAssertionError, HF_ID_BASE_URL, cardAssertionJwks, verifyCardAssert
 import { namesAgree } from "./names";
 import { createPayrollLedgerFeed } from "./ledger-feed";
 import { payrollPaymentDisplay } from "./payroll-settlement";
-import { KBIZ_QR_ROUTES, kbizLoginQrPageResponse, kbizLoginQrPngResponse, kbizLoginQrStateResponse } from "./kbiz-login-qr";
+import {
+  KBIZ_QR_ROUTES,
+  kbizLoginQrPageResponse,
+  kbizLoginQrPngResponse,
+  kbizLoginQrStateResponse,
+  kbizLoginRequestResponse,
+} from "./kbiz-login-qr";
 
 const staticFile = async (path: string, mime: string) => {
   const buf = await readFile(path);
@@ -163,12 +169,15 @@ const app = new Elysia()
   // K BIZ QR login handoff (CR-2026-09-17). kbiz-bot cannot log in unattended
   // any more — the bank demands a scan from the K BIZ phone app on every web
   // login — so the bot publishes the QR and payroll-form shows it to whoever
-  // the payroll hostname's Cloudflare Access app admits. Read-only: this side
-  // never writes to the handoff dir, and serves no origin auth of its own (see
-  // src/property-hint.ts for why this app verifies nothing here).
+  // the payroll hostname's Cloudflare Access app admits. The POST is the
+  // operator's button: the only thing this side writes (`login.request`), and
+  // the only way a login ever starts. No origin auth of its own — the header
+  // it records is informational (see src/property-hint.ts for why this app
+  // verifies nothing here).
   .get(KBIZ_QR_ROUTES.page, () => kbizLoginQrPageResponse())
   .get(KBIZ_QR_ROUTES.png, () => kbizLoginQrPngResponse())
   .get(KBIZ_QR_ROUTES.state, () => kbizLoginQrStateResponse())
+  .post(KBIZ_QR_ROUTES.request, ({ headers }) => kbizLoginRequestResponse({ headers }))
 
   // Sanitised status feed for the /status page — no per-row PII, no xlsx
   // path, no embedded sheet snapshot. Just enough for HR to track their

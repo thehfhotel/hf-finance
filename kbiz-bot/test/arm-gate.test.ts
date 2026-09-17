@@ -864,12 +864,15 @@ describe("process-queue.ts wiring", () => {
     expect(normalReturn).toContain('{ kind: "armed", id: req.id, outcome: "success" }');
     expect(normalReturn).toContain('{ kind: "not-armed", id: req.id }');
 
-    // …up to the three closing braces that end the catch, the item loop and
-    // the withSession callback (matched loosely, so a re-indent cannot break
-    // the assertion this test actually makes).
-    const crashEnd = src.slice(crashIdx).search(/\}\s*\n\s*\}\s*\n\s*\}\);/);
-    expect(crashEnd).toBeGreaterThan(-1);
-    const crashBlock = src.slice(crashIdx, crashIdx + crashEnd);
+    // …up to the end of the batch. This used to anchor on the three closing
+    // braces that ended the catch, the item loop and the `withSession`
+    // callback; CR-2026-09-17 took the callback away (the resident keeper owns
+    // the context and hands `processBatch` its page), so the block is pinned to
+    // the function's own return instead — same invariant, one nesting level
+    // less, and still indentation-insensitive.
+    const crashEnd = src.indexOf("return approved.length;", crashIdx);
+    expect(crashEnd).toBeGreaterThan(crashIdx);
+    const crashBlock = src.slice(crashIdx, crashEnd);
     expect(crashBlock).toContain('if (pushLock) prev = { kind: "armed", id: req.id, outcome: "unconfirmed" };');
   });
 

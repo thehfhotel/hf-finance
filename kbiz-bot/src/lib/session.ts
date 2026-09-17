@@ -7,6 +7,7 @@ import {
   KBIZ_LOGIN_FORM_SELECTOR,
   maskQrMessage,
   QrLoginRequiredError,
+  SESSION_BOUNCE_ERROR,
 } from "./qr-login-core";
 import { runQrLoginHandoff } from "./qr-login";
 import { stabiliseSession } from "./session-probe";
@@ -40,7 +41,24 @@ export type LoginOptions = { onQr?: "refuse"; reason?: string } | { onQr: "hando
 // working unchanged.
 export { isUnauthenticatedUrl };
 
-export async function withSession<T>(fn: (ctx: BrowserContext, page: Page) => Promise<T>): Promise<T> {
+/** An open persistent context and the one page every flow drives. */
+export type KbizSession = { ctx: BrowserContext; page: Page };
+
+/**
+ * Open the persistent Chromium profile and return its context + first page.
+ *
+ * Split out of `withSession` for CR-2026-09-17: the resident session keeper
+ * opens ONE context at startup and holds it for the process lifetime (the
+ * queue step, the keepalive ping and the operator-triggered QR login all share
+ * that single page), so it needs the open and the close as separate acts
+ * rather than a scope. `withSession` is unchanged in behaviour and is still
+ * what every one-shot script uses — it is now literally open + finally close.
+ *
+ * NOTE for the resident caller: nothing here installs a signal handler.
+ * Playwright's own SIGTERM/SIGINT handling closes the browser on `docker
+ * stop`, and a handler of ours would race it — see the keeper.
+ */
+export async function openSession(): Promise<KbizSession> {
   const headless = process.env.KBIZ_HEADLESS === "1";
   const ctx = await chromium.launchPersistentContext(USER_DATA_DIR, {
     headless,
@@ -57,10 +75,25 @@ export async function withSession<T>(fn: (ctx: BrowserContext, page: Page) => Pr
     })
   );
   const page = ctx.pages()[0] ?? (await ctx.newPage());
+  return { ctx, page };
+}
+
+/**
+ * Close the persistent context. Never throws: a context that is already gone
+ * (crashed, or closed under us by `docker stop`) is exactly the case the
+ * keeper calls this in before reopening, and turning that into an exception
+ * would take the watch loop down with it.
+ */
+export async function closeSession(session: KbizSession): Promise<void> {
+  await session.ctx.close().catch(() => {});
+}
+
+export async function withSession<T>(fn: (ctx: BrowserContext, page: Page) => Promise<T>): Promise<T> {
+  const session = await openSession();
   try {
-    return await fn(ctx, page);
+    return await fn(session.ctx, session.page);
   } finally {
-    await ctx.close();
+    await closeSession(session);
   }
 }
 
@@ -133,7 +166,7 @@ export async function gotoAuthenticated(page: Page, url: string, opts?: LoginOpt
 
   // Masked: this message reaches a queue item's `result.error` and Slack, and
   // the URL it carries is very often the bank's `loginQR.do?cmd=<token>`.
-  throw new Error(`After re-login still bouncing — final URL: ${maskQrMessage(page.url())}`);
+  throw new Error(`${SESSION_BOUNCE_ERROR} — final URL: ${maskQrMessage(page.url())}`);
 }
 
 export async function ensureLoggedIn(page: Page, opts?: LoginOptions): Promise<void> {

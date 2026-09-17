@@ -11,15 +11,19 @@ import { describe, expect, it } from "bun:test";
 import {
   decodeQrDataUri,
   isQrLoginUrl,
+  isSessionDeathError,
+  maskedNote,
   maskQrMessage,
   QR_HANDOFF_TIMEOUT_MS,
   QR_POLL_MS,
   QR_WINDOW_MS,
+  QrLoginRequiredError,
   QrLoginTimeoutError,
   qrSuccessMessage,
   qrTimeoutMessage,
   qrWaitingMessage,
   runQrHandoff,
+  SESSION_BOUNCE_ERROR,
 } from "../src/lib/qr-login-core";
 import {
   PNG_1PX_B64,
@@ -96,7 +100,7 @@ describe("Slack text (contract-pinned)", () => {
   it("confirms the login and reports the timeout", () => {
     expect(qrSuccessMessage(REASON)).toBe(":white_check_mark: kbiz-bot: เข้าสู่ระบบ K BIZ แล้ว (2 approved item(s))");
     expect(qrTimeoutMessage()).toBe(
-      ":hourglass: kbiz-bot: ไม่มีการสแกนใน 6.5 นาที — งานยังรออยู่ จะขอใหม่ใน 10 นาที",
+      ":hourglass: kbiz-bot: ไม่มีการสแกนใน 6.5 นาที — งานยังรออยู่ กดปุ่มใหม่เมื่อพร้อม",
     );
   });
 });
@@ -107,6 +111,44 @@ describe("maskQrMessage", () => {
       "bounced to /authen/loginQR.do while waiting",
     );
     expect(maskQrMessage("could not write 1234567890")).toBe("could not write ******");
+  });
+});
+
+describe("maskedNote", () => {
+  it("is the one shape a session.json note may take: masked, one line, bounded", () => {
+    // session.json is served on the Cloudflare-gated operator page, and since
+    // June 2026 a failed navigation's message carries the bank's own
+    // `loginQR.do?cmd=<session token>`.
+    expect(maskedNote("warm-up failed: navigating to /authen/loginQR.do?cmd=SECRETTOKEN\n  call log:\n  - x")).toBe(
+      "warm-up failed: navigating to /authen/loginQR.do call log: - x",
+    );
+    expect(maskedNote(`check failed: ${"x".repeat(400)}`).length).toBe(160);
+  });
+});
+
+describe("isSessionDeathError", () => {
+  it("is true for the contract's death signals and nothing else", () => {
+    // These two are PROOF the session is gone: the bank asked for a scan, or it
+    // kept bouncing us after a full re-login (the session-expired text lands
+    // there too, via the same recovery path).
+    expect(isSessionDeathError(new QrLoginRequiredError())).toBe(true);
+    expect(isSessionDeathError(new Error(`${SESSION_BOUNCE_ERROR} — final URL: /authen/login.jsp`))).toBe(true);
+
+    // A bank outage, a network failure, a context that went away: unclassified,
+    // so the keeper retries at the next keepalive rather than announcing a
+    // death, recording a blip as the bank's session cap and then waiting for a
+    // human it does not need.
+    expect(isSessionDeathError(new Error("locator.waitFor: Timeout 30000ms exceeded."))).toBe(false);
+    expect(isSessionDeathError(new Error("Target page, context or browser has been closed"))).toBe(false);
+    expect(isSessionDeathError(undefined)).toBe(false);
+  });
+
+  it("reads the same literal session.ts throws", () => {
+    // Two copies of "After re-login still bouncing" is how a classifier goes
+    // quietly wrong: the string would still be thrown, just never matched.
+    const sessionSrc = readFileSync(fileURLToPath(new URL("../src/lib/session.ts", import.meta.url)), "utf8");
+    expect(sessionSrc).toContain("SESSION_BOUNCE_ERROR");
+    expect(sessionSrc).not.toContain("After re-login still bouncing");
   });
 });
 

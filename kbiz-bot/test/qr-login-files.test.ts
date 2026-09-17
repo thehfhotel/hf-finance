@@ -8,14 +8,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
+  claimLoginRequest,
   clearStaleQrPublication,
+  LOGIN_REQUEST_CLAIMED_FILE,
+  LOGIN_REQUEST_FILE,
   QR_PNG_FILE,
+  QR_SESSION_FILE,
   QR_STATE_FILE,
+  readLoginRequest,
   removeQrPng,
   writeQrPng,
   writeQrState,
+  writeSessionFile,
 } from "../src/lib/qr-login-files";
 import { terminalState, type QrLoginState } from "../src/lib/qr-login-core";
+import { sessionFileFrom, initialKeeperState, applyCheckResult, setPending } from "../src/lib/session-keeper-core";
 
 let dir: string;
 beforeEach(() => {
@@ -125,5 +132,109 @@ describe("clearStaleQrPublication", () => {
     // parse is not rewritten from a guess.
     expect(existsSync(pngPath())).toBe(false);
     expect(readFileSync(statePath(), "utf8")).toBe("{ not json");
+  });
+});
+
+// ── The resident session record (CR-2026-09-17) ───────────────────────────
+
+describe("writeSessionFile", () => {
+  const sessionPath = () => join(dir, QR_SESSION_FILE);
+  const readSession = () => JSON.parse(readFileSync(sessionPath(), "utf8"));
+
+  it("publishes the keeper's record atomically, with the contract's fields", () => {
+    const alive = applyCheckResult(initialKeeperState(), {
+      nowMs: Date.parse("2026-09-17T01:00:00.000Z"),
+      alive: true,
+      note: "keepalive ok",
+    }).state;
+    writeSessionFile(sessionFileFrom(setPending(alive, 2)), dir);
+
+    expect(readSession()).toEqual({
+      alive: true,
+      since: "2026-09-17T01:00:00.000Z",
+      checkedAt: "2026-09-17T01:00:00.000Z",
+      endedAt: null,
+      lastLifetimeMs: null,
+      pending: 2,
+      note: "keepalive ok",
+    });
+    // payroll-form polls this every 5 s and offers the login button when it
+    // reads "no session" — a half-written object must never be visible.
+    expect(existsSync(join(dir, `${QR_SESSION_FILE}.tmp`))).toBe(false);
+    expect(readFileSync(sessionPath(), "utf8").endsWith("}\n")).toBe(true);
+  });
+
+  it("rewrites in place, and creates the directory if it is not there yet", () => {
+    const nested = join(dir, "does", "not", "exist");
+    writeSessionFile(sessionFileFrom(initialKeeperState()), nested);
+    expect(JSON.parse(readFileSync(join(nested, QR_SESSION_FILE), "utf8")).alive).toBe(false);
+
+    writeSessionFile(sessionFileFrom(setPending(initialKeeperState(), 4)), nested);
+    expect(JSON.parse(readFileSync(join(nested, QR_SESSION_FILE), "utf8")).pending).toBe(4);
+  });
+});
+
+describe("readLoginRequest / claimLoginRequest", () => {
+  const requestPath = () => join(dir, LOGIN_REQUEST_FILE);
+  const claimedPath = () => join(dir, LOGIN_REQUEST_CLAIMED_FILE);
+  const write = (body: string) => writeFileSync(requestPath(), body);
+
+  it("reads what payroll-form writes", () => {
+    write(JSON.stringify({ requestedAt: "2026-09-17T01:00:00.000Z", by: "operator@example.com" }));
+    expect(readLoginRequest(dir)).toEqual({
+      requestedAt: "2026-09-17T01:00:00.000Z",
+      by: "operator@example.com",
+    });
+  });
+
+  it("is null when nobody has pressed the button", () => {
+    expect(readLoginRequest(dir)).toBeNull();
+    expect(readLoginRequest(join(dir, "no", "such", "dir"))).toBeNull();
+  });
+
+  it("falls back to 'unknown' when Cloudflare gave payroll-form no email", () => {
+    write(JSON.stringify({ requestedAt: "2026-09-17T01:00:00.000Z" }));
+    expect(readLoginRequest(dir)!.by).toBe("unknown");
+  });
+
+  it("flattens a header that tries to carry newlines into the Slack line", () => {
+    write(JSON.stringify({ requestedAt: "2026-09-17T01:00:00.000Z", by: "a\nb\tc " }));
+    expect(readLoginRequest(dir)!.by).toBe("a b c");
+    write(JSON.stringify({ requestedAt: "2026-09-17T01:00:00.000Z", by: "x".repeat(400) }));
+    expect(readLoginRequest(dir)!.by.length).toBe(120);
+  });
+
+  it("still reports a MALFORMED request, so it can be claimed away", () => {
+    // The file's presence IS the ask. Returning null here would leave it on
+    // disk forever, with the page stuck on "กำลังเตรียม QR…" and the bot
+    // ignoring it — only the claim removes it.
+    write("{ not json");
+    expect(readLoginRequest(dir)).toEqual({ requestedAt: "", by: "unknown" });
+    expect(claimLoginRequest(dir)).toBe(true);
+    expect(readLoginRequest(dir)).toBeNull();
+  });
+
+  it("claims by renaming — one file, never both, never neither", () => {
+    write(JSON.stringify({ requestedAt: "2026-09-17T01:00:00.000Z", by: "operator@example.com" }));
+    expect(claimLoginRequest(dir)).toBe(true);
+
+    expect(existsSync(requestPath())).toBe(false);
+    expect(JSON.parse(readFileSync(claimedPath(), "utf8")).by).toBe("operator@example.com");
+    // …and the claim is what makes a second tick leave the bank alone.
+    expect(readLoginRequest(dir)).toBeNull();
+    expect(claimLoginRequest(dir)).toBe(false);
+  });
+
+  it("overwrites a stale claimed file rather than refusing the new request", () => {
+    writeFileSync(claimedPath(), JSON.stringify({ requestedAt: "2026-09-01T00:00:00.000Z", by: "ตัวอย่าง" }));
+    write(JSON.stringify({ requestedAt: "2026-09-17T02:00:00.000Z", by: "operator@example.com" }));
+
+    expect(claimLoginRequest(dir)).toBe(true);
+    expect(JSON.parse(readFileSync(claimedPath(), "utf8")).requestedAt).toBe("2026-09-17T02:00:00.000Z");
+  });
+
+  it("never throws when there is nothing to claim", () => {
+    expect(claimLoginRequest(dir)).toBe(false);
+    expect(claimLoginRequest(join(dir, "no", "such", "dir"))).toBe(false);
   });
 });

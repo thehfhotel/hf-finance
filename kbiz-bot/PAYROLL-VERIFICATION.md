@@ -29,6 +29,15 @@ Several due runs share one serialized bank session. A newly submitted, due run
 can trigger its first check independently of another run's six-hour cooldown.
 No eligible run means no bank session. Future-dated payroll is not polled.
 
+Since CR-2026-09-17 (resident session) the watch loop hands the check the
+keeper's already-open page (`checkPayrollBankSettlements(dir, now, { page })`),
+so a due run reads the history in the session the bot is already keeping alive
+instead of launching a second browser and a second K BIZ login. The check still
+runs ONLY while that session is alive, still read-only, still after the
+payment-priority and arm-lock guards; omitting `page` falls back to the old
+`withSession` path, which is what the one-shot CLI invocation uses. Tests keep
+injecting `readHistory` and never touch either path.
+
 The existing payment-priority and arm-lock guards still apply before every
 check. All queue AND archive records remain available to the exact-data matcher
 for reference/filename ownership, even if outside the automatic checking window.

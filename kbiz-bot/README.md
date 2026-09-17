@@ -19,7 +19,10 @@ cp .env.example .env
 ## Scripts
 
 ```sh
-npm run login        # warm up / verify the persistent browser profile
+npm run login        # DEV ONLY: warm up / verify the persistent browser
+                     # profile. Never against the prod profile while the
+                     # watcher is up — production logs in from the page's
+                     # "เข้าสู่ระบบ K BIZ" button instead (see below).
 npm run verify       # quick check the session is still alive
 npm run list         # scrape the registered-payroll-account list
                      # writes ../data/kbiz-registered.json
@@ -111,8 +114,11 @@ These env vars decouple the bot's data dir from its default `../data` layout
 | `KBIZ_QUEUE_DIR`  | `../data/queue` | where the watch loop looks for queue files                          |
 | `KBIZ_SLIPS_DIR`  | `../data/slips` | where captured e-slip screenshots are written                       |
 | `KBIZ_SHARED_DIR` | `../data`       | root a `transfer-other` intent's relative paths (`voucherFile`) resolve against |
-| `KBIZ_QR_DIR`     | `../data/qr-login` | where the login QR + its `state.json` are published for payroll-form |
+| `KBIZ_QR_DIR`     | `../data/qr-login` | where the login QR, its `state.json`, the keeper's `session.json` and the operator's `login.request` live |
 | `KBIZ_QR_PAGE_URL` | `https://payroll.thehfhotel.org/kbiz/login-qr` | the link Slack sends the operator |
+| `KBIZ_TICK_MS`    | `5000`          | how often the resident loop wakes up                                 |
+| `KBIZ_KEEPALIVE_MS` | `240000`      | how often it re-proves the K BIZ session                             |
+| `KBIZ_LOGIN_REMINDER_HHMM` | `08:30` | Asia/Bangkok time of the daily "still not logged in" reminder       |
 
 See `EVERGREEN.md` for the `/srv/kbiz-queue` cross-repo mount this is meant
 to enable in production — and, alongside it, the separate `/srv/kbiz-bot`
@@ -196,71 +202,135 @@ for the incidents this closes.
 ## Session model
 
 All scripts go through `src/lib/session.ts`:
-- `withSession(fn)` opens a Chromium **persistent context** rooted at
-  `browser-data/`. The same browser profile is reused across every
-  script — KBIZ sees one continuous browser, no
+- `openSession()` / `closeSession(s)` open and close a Chromium **persistent
+  context** rooted at `browser-data/`. The same browser profile is reused
+  across every script — KBIZ sees one continuous browser, no
   "signed-in-on-another-device" cascades.
+- `withSession(fn)` is those two around a callback — what every one-shot
+  script uses.
 - `ensureLoggedIn(page, opts?)` is idempotent: navigates to the dashboard,
   returns immediately if already authenticated, otherwise runs the
   login flow — which now needs a QR scan (below).
 
+**The watch container is different: its session is RESIDENT.**
+`process-queue.ts --watch` opens ONE context at startup and keeps it for the
+whole process (`src/lib/session-keeper.ts`). Every 5 s it ticks:
+
+1. **an operator pressed the button** → claim `login.request`, run the QR
+   handoff (and nothing else that tick);
+2. **the session is alive and the last check is 4 min old** → re-prove it
+   (`KBIZ_KEEPALIVE_MS`);
+3. **30 s since the last queue step** (`QUEUE_POLL_MS`) → publish payee
+   handles, run the batch if the session is alive, count what is still
+   waiting, then the read-only payroll settlement check;
+4. **dead with work waiting** → the "งานรอ" nudge;
+5. **dead in the hour after 08:30 Bangkok** → the morning reminder (the day is
+   seeded at startup, so a restart at 14:00 does not post a sunrise line).
+
+Every one of those decisions is a pure function in
+`src/lib/session-keeper-core.ts`, tested on a virtual clock. The keeper writes
+`session.json` after every check and whenever the waiting count changes; that
+file is what the operator page reads.
+
 Don't run two scripts concurrently — they would deadlock on
-Chromium's user-data-dir lock. Run one at a time.
+Chromium's user-data-dir lock. Run one at a time, and never run one at all
+against the prod profile while the watcher is up.
 
 ## Logging in needs a QR scan (operator guide)
 
 Since June 2026 K BIZ asks for a scan from the **K BIZ phone app** after
-user/pass on every web login. There is no unattended way past it, so the bot
-hands the scan off to a human:
+user/pass on every web login, and the app cannot scan a QR out of a saved
+picture — it has to point at a real screen. So a login always needs a SECOND
+screen (laptop, office PC) next to the phone.
 
-**What the Slack message means.**
+**The bot therefore never starts a login by itself.** It keeps its session
+alive, tells you when something changes, and waits for you to press a button.
 
-> :lock: kbiz-bot: K BIZ ต้องสแกน QR เพื่อเข้าสู่ระบบ (2 approved item(s), QR #1)
-> — เปิด https://payroll.thehfhotel.org/kbiz/login-qr บนคอมพิวเตอร์
-> แล้วสแกนด้วยแอป K BIZ ภายใน 5 นาที
+### The button
 
-The bot is parked at the bank's login QR page with work waiting (here: two
-approved queue items) and it has published the code. To clear it:
+Open `https://payroll.thehfhotel.org/kbiz/login-qr` (the same Cloudflare Access
+login as the rest of payroll-form) **on a computer**, when the phone with the
+K BIZ app is in your hand. The page shows one of four things:
 
-1. **Open the link on a computer** — `https://payroll.thehfhotel.org/kbiz/login-qr`,
-   the same Cloudflare Access login as the rest of payroll-form. It has to be a
-   screen you can point the phone at, so not the phone running K BIZ itself.
-2. **Scan the QR with the K BIZ app** (the app's own scan button, the same one
-   you use to log in yourself).
-3. **You have ~5 minutes.** The page shows the bank's countdown and refreshes
-   itself every 5 s; if the bank rotates the code the picture swaps on its own
-   and Slack re-pings at most once a minute (`QR #2`, `QR #3`, …).
+| the page says | what it means | what to do |
+| --- | --- | --- |
+| a QR code | the bot is parked at the bank's login page with a live code | scan it with the K BIZ app, within ~5 min |
+| "กำลังเตรียม QR…" | your press landed; the bot is claiming it and asking the bank | wait ~10 s — the QR appears by itself |
+| "เข้าสู่ระบบ K BIZ อยู่ ตั้งแต่ …" | the session is alive; the bot is working | nothing |
+| the **"เข้าสู่ระบบ K BIZ"** button | no session | press it, then stay on the page |
 
-Then `:white_check_mark: kbiz-bot: เข้าสู่ระบบ K BIZ แล้ว (…)` means the session is
-live and the batch runs. `:hourglass: … ไม่มีการสแกนใน 6.5 นาที` means nobody
-scanned: **nothing was touched** — every item is still `approved` — and the bot
-asks again in 10 minutes. Scanning the phone-app login by hand in the meantime
-does not help; wait for the next ask, or pre-warm (below).
+The page refreshes itself every 5 s, so a fresh or rotated QR swaps in on its
+own. You have the bank's own ~5 min per code, and the bot waits 6.5 min in
+total before giving up.
+
+### What each Slack line means
+
+> :warning: kbiz-bot: เซสชัน K BIZ หมดอายุแล้ว (อยู่ได้ 5 ชม. 10 นาที) — เมื่อมีจอที่สองแล้ว
+> เปิด https://payroll.thehfhotel.org/kbiz/login-qr แล้วกด "เข้าสู่ระบบ K BIZ"
+
+The session the bot was keeping alive has ended — the bank asked for a scan, or
+it kept bouncing us after a re-login. A bank outage or a network blip is NOT
+this line: those are retried at the next keepalive and only become a death after
+three in a row. Posted **once** per death, and
+the duration in brackets is how long that session survived — that number is the
+whole point of the keepalive: it is how we learn the bank's session cap. There
+is no rush unless work is waiting; log in when a second screen is at hand.
+
+> :hourglass: kbiz-bot: มี 2 งานรอ K BIZ — เปิด … แล้วกด "เข้าสู่ระบบ K BIZ"
+
+Approved transfers are queued and there is no session to run them with. The
+items are **untouched** — nothing was claimed, nothing was submitted, nothing
+can have paid twice. Repeats when the count changes, otherwise at most hourly.
+
+> :sunrise: kbiz-bot: เซสชัน K BIZ ยังไม่ได้เข้าสู่ระบบ — เปิด … แล้วกด "เข้าสู่ระบบ K BIZ"
+
+08:30 Bangkok and still no session. Once per Bangkok day, only while logged
+out, and only in the hour after 08:30 — a restart later in the day does not
+re-post it, and a session that dies in the evening gets the "งานรอ" nudge
+instead.
+
+> :lock: kbiz-bot: K BIZ ต้องสแกน QR เพื่อเข้าสู่ระบบ (login requested by …, QR #1)
+> — เปิด … บนคอมพิวเตอร์ แล้วสแกนด้วยแอป K BIZ ภายใน 5 นาที
+
+Your press landed and the code is on the page. `QR #2`, `QR #3` … mean the bank
+rotated the code; the picture swaps by itself and Slack re-pings at most once a
+minute.
+
+> :white_check_mark: kbiz-bot: เข้าสู่ระบบ K BIZ แล้ว (…)
+
+Scanned and confirmed. Any waiting batch runs within 30 s.
+
+> :hourglass: kbiz-bot: ไม่มีการสแกนใน 6.5 นาที — งานยังรออยู่ กดปุ่มใหม่เมื่อพร้อม
+
+Nobody scanned. **Nothing was touched** — every item is still `approved`. The
+bot will NOT ask again on its own: press the button when you are ready.
+
+> :white_check_mark: kbiz-bot: เซสชัน K BIZ ยังใช้งานได้ ไม่ต้องสแกน
+
+You pressed the button but the session was fine. Nothing to do.
+
+### Where it all lives
 
 The page is the *only* place the code is published: the bot writes
 `current.png` + `state.json` into `KBIZ_QR_DIR`, the PNG decoded from the login
 page's own `img.qrcode` data URI. It is never a screenshot, and the QR file is
-deleted the moment the handoff ends. Code map: `lib/qr-login-core.ts` decides
-(pure), `lib/qr-login-files.ts` writes those two files, `lib/qr-login.ts`
-drives the browser, `lib/slack.ts` posts the lines.
+deleted the moment the handoff ends. Alongside them the keeper writes
+`session.json` (alive / since / checkedAt / endedAt / lastLifetimeMs / pending
+/ note) and payroll-form writes `login.request`, which the bot claims by
+renaming it to `login.request.claimed` **before** it touches the bank — so one
+press is one login attempt, even across a crash.
 
-**Pre-warming before a known batch.** The watch container holds the browser
-profile, so you cannot just run `npm run login` beside it. Use the wrapper —
-it pauses the watcher, runs the login once, and unpauses in a trap.
+Code map: `lib/session-keeper-core.ts` decides (pure — tick order, rate limits,
+lifetimes, Bangkok days, every Slack line), `lib/session-keeper.ts` holds the
+browser, `lib/qr-login-core.ts` runs the handoff state machine (pure),
+`lib/qr-login-files.ts` writes all four files, `lib/qr-login.ts` drives the
+page, `lib/slack.ts` posts the lines.
 
-The script is NOT on evergreen: the deploy tarball ships `docker-compose.yml`
-and nothing else, and the image copies only `kbiz-bot/src`. Copy it over first
-(it `cd`s to the compose dir itself, so where it lands does not matter):
-
-```sh
-scp kbiz-bot/scripts/kbiz-login-handoff.sh evergreen:~/
-ssh evergreen bash '~/kbiz-login-handoff.sh'
-```
-
-(It re-executes itself under `sudo -n`: the compose dir's `.env` is root-only
-on evergreen and `docker compose` has to read it.) It only requests the scan; it never arms, taps or approves anything — and it
-refuses to pause the watcher while an approval push is live, so run it between
-batches, not on top of one.
+**`npm run login` is a DEV tool now.** It opens its own browser and does the
+same handoff, which is exactly what you must NOT do beside the watch container:
+two processes fighting over `browser-data/`, and a second K BIZ login that
+kills the resident session. The old `scripts/kbiz-login-handoff.sh` wrapper
+(pause the watcher, log in, unpause) is deleted — the button replaces it.
 
 ## DRY mobile-approval helper
 
