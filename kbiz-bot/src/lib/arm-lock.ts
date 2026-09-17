@@ -19,8 +19,9 @@
  * "playwright" import here, not even a type one.
  */
 
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { writeAtomic } from "./fs-atomic";
 import type { ArmLock } from "./arm-gate";
 
 /**
@@ -59,20 +60,15 @@ export function readArmLockRaw(dir: string = STATE_DIR): { text: string | null; 
 }
 
 /**
- * Atomic: write `<file>.tmp`, then rename over the real path. rename(2) within
- * one filesystem is atomic, so a reader either sees the whole previous lock or
- * the whole new one — never a half-written file that parseArmLock would have
- * to treat as corrupt (and therefore as LIVE, wedging the bot for 10.5 min for
- * no reason).
+ * Atomic (fs-atomic.ts, shared with the QR publication): a reader either sees
+ * the whole previous lock or the whole new one — never a half-written file
+ * that parseArmLock would have to treat as corrupt (and therefore as LIVE,
+ * wedging the bot for 10.5 min for no reason).
  *
  * THROWS on failure, deliberately: the caller must fail CLOSED. No lock, no
  * push. A disk that cannot record the hold is a disk that cannot be trusted to
  * prevent a double pay.
  */
 export function writeArmLock(lock: ArmLock, dir: string = STATE_DIR): void {
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, ARM_LOCK_FILE);
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(lock, null, 2)}\n`, "utf8");
-  renameSync(tmp, path);
+  writeAtomic(join(dir, ARM_LOCK_FILE), `${JSON.stringify(lock, null, 2)}\n`);
 }

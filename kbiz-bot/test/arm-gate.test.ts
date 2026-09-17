@@ -840,7 +840,11 @@ describe("process-queue.ts wiring", () => {
     // pre-arm window doesn't start ticking during a 90 s wait that hasn't
     // armed anything yet — same ordering transfer-other uses (gap, THEN
     // arm-lock, THEN flow).
-    const acquireIdx = src.indexOf('let pushLock: ArmLock | undefined;\n      if (req.type === "transfer-payroll" || req.type === "add-payroll") {');
+    // Indentation-insensitive: this pins the ORDERING, not the nesting depth
+    // of the batch loop the block happens to sit in.
+    const acquireIdx = src.search(
+      /let pushLock: ArmLock \| undefined;\s*\n\s*if \(req\.type === "transfer-payroll" \|\| req\.type === "add-payroll"\) \{/,
+    );
     expect(acquireIdx).toBeGreaterThan(-1);
     const branch = src.slice(acquireIdx, src.indexOf("const candidate = conservativeLock(req.id, Date.now());", acquireIdx));
     expect(branch).toContain("if (gapMs > 0)");
@@ -860,7 +864,12 @@ describe("process-queue.ts wiring", () => {
     expect(normalReturn).toContain('{ kind: "armed", id: req.id, outcome: "success" }');
     expect(normalReturn).toContain('{ kind: "not-armed", id: req.id }');
 
-    const crashBlock = src.slice(crashIdx, src.indexOf("}\n    }\n  });", crashIdx));
+    // …up to the three closing braces that end the catch, the item loop and
+    // the withSession callback (matched loosely, so a re-indent cannot break
+    // the assertion this test actually makes).
+    const crashEnd = src.slice(crashIdx).search(/\}\s*\n\s*\}\s*\n\s*\}\);/);
+    expect(crashEnd).toBeGreaterThan(-1);
+    const crashBlock = src.slice(crashIdx, crashIdx + crashEnd);
     expect(crashBlock).toContain('if (pushLock) prev = { kind: "armed", id: req.id, outcome: "unconfirmed" };');
   });
 

@@ -1,7 +1,13 @@
 import { chromium, type BrowserContext, type Page } from "playwright";
 import { resolve } from "node:path";
 import { isUnauthenticatedUrl } from "./approval-wait";
-import { isQrLoginUrl, KBIZ_DASHBOARD_URL, maskQrMessage, QrLoginRequiredError } from "./qr-login-core";
+import {
+  isQrLoginUrl,
+  KBIZ_DASHBOARD_URL,
+  KBIZ_LOGIN_FORM_SELECTOR,
+  maskQrMessage,
+  QrLoginRequiredError,
+} from "./qr-login-core";
 import { runQrLoginHandoff } from "./qr-login";
 import { stabiliseSession } from "./session-probe";
 
@@ -11,7 +17,6 @@ const USER_DATA_DIR = resolve("browser-data");
 // and reimbursement wants Thai names. Every text matcher that navigates the
 // UI is bilingual, and bank matching goes through aliasesForBank().
 const LOGIN_URL = "https://kbiz.kasikornbank.com/authen/login.jsp?lang=th";
-const DASHBOARD_URL = KBIZ_DASHBOARD_URL;
 
 /**
  * What a caller is willing to do when K BIZ demands a QR scan (it does, on
@@ -21,14 +26,12 @@ const DASHBOARD_URL = KBIZ_DASHBOARD_URL;
  * a scrape, a flow or the payroll settlement check has no business making a
  * human walk to a phone, so it throws `QrLoginRequiredError` at once and lets
  * its own unavailable-path handle it. Only the batch warm-up in
- * process-queue.ts and the operator's `npm run login` pass `"handoff"`.
+ * process-queue.ts and the operator's `npm run login` pass `"handoff"` — and
+ * a `reason` with it, which is REQUIRED there and meaningless anywhere else:
+ * it is published in the QR state file and in every Slack line the handoff
+ * posts, so there is no fallback for this file to invent.
  */
-export type OnQrPolicy = "handoff" | "refuse";
-export interface LoginOptions {
-  onQr?: OnQrPolicy;
-  /** Why the login is needed — published in the QR state file and in Slack. */
-  reason?: string;
-}
+export type LoginOptions = { onQr?: "refuse"; reason?: string } | { onQr: "handoff"; reason: string };
 
 // Moved to approval-wait.ts (a pure, playwright-free module) so the
 // post-"Next" approval wait loop can import it without dragging playwright
@@ -68,8 +71,8 @@ async function loginFlow(page: Page, opts?: LoginOptions): Promise<void> {
 
   console.log("→ Logging in …");
   await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
-  await page.locator("#userName").waitFor({ state: "visible", timeout: 30_000 });
-  await page.locator("#userName").fill(username);
+  await page.locator(KBIZ_LOGIN_FORM_SELECTOR).waitFor({ state: "visible", timeout: 30_000 });
+  await page.locator(KBIZ_LOGIN_FORM_SELECTOR).fill(username);
   await page.locator("#password").fill(password);
   await page.locator("#loginBtn").click();
   // Since June 2026 user/pass is only half a login: the bank answers
@@ -82,14 +85,14 @@ async function loginFlow(page: Page, opts?: LoginOptions): Promise<void> {
     timeout: 60_000,
   });
   if (isQrLoginUrl(page.url())) {
-    if ((opts?.onQr ?? "refuse") !== "handoff") {
+    if (opts?.onQr !== "handoff") {
       // No wait at all: nothing this caller can do will make the QR go away,
       // and a human is not going to be summoned on its behalf.
       throw new QrLoginRequiredError();
     }
     // Returns only once the dashboard is CONFIRMED (or throws
     // QrLoginTimeoutError). Never resubmits credentials.
-    await runQrLoginHandoff(page, { reason: opts?.reason ?? "kbiz-bot login" });
+    await runQrLoginHandoff(page, { reason: opts.reason });
     console.log("✓ Logged in");
     return;
   }
@@ -134,5 +137,5 @@ export async function gotoAuthenticated(page: Page, url: string, opts?: LoginOpt
 }
 
 export async function ensureLoggedIn(page: Page, opts?: LoginOptions): Promise<void> {
-  await gotoAuthenticated(page, DASHBOARD_URL, opts);
+  await gotoAuthenticated(page, KBIZ_DASHBOARD_URL, opts);
 }

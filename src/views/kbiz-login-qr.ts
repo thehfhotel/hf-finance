@@ -8,9 +8,11 @@ import type { KbizQrState, KbizQrStatus } from "../kbiz-login-qr";
 // `state.json`; this page only reads them (`src/kbiz-login-qr.ts`).
 //
 // The page is server-rendered for the state at request time AND polls
-// `/kbiz/login-qr/state.json` every 5 s, updating the same nodes in place —
-// that is why the copy below is emitted once as JSON and reused by both sides
-// instead of being written twice.
+// `KBIZ_QR_ROUTES.state` every 5 s, updating the same nodes in place — that is
+// why the copy, the routes and the first state are emitted once as JSON and
+// reused by both sides instead of being written twice. The route paths are
+// passed in by the caller (src/kbiz-login-qr.ts owns them) so this view has
+// no value import back into the module that renders it.
 //
 // Auth: none here, deliberately. `payroll.thehfhotel.org` is gated by a
 // whole-hostname Cloudflare Access app; see `src/property-hint.ts` for why
@@ -56,16 +58,25 @@ const esc = (value: string) => value.replace(/[&<>"']/g, (ch) => ESCAPES[ch]!);
 // everything else is already legal JSON text. Replacer function again.
 const jsonForScript = (value: unknown) => JSON.stringify(value).replace(/</g, () => "\\u003c");
 
-/** The URL the <img> points at while a QR is live — cache-busted by updatedAt. */
-export function kbizQrImageSrc(updatedAt: string | null | undefined): string {
-  return `/kbiz/login-qr.png?t=${encodeURIComponent(updatedAt ?? "")}`;
-}
+// The cache-buster key is spelled here and nowhere else: the server builds the
+// first <img> src from this prefix, and the poller rebuilds later ones from the
+// same prefix, handed to it through the boot blob.
+const qrSrcPrefix = (pngPath: string) => `${pngPath}?t=`;
 
-export function renderKbizLoginQrPage(state: KbizQrState): string {
+/** The URL the <img> points at while a QR is live — cache-busted by updatedAt. */
+const qrImageSrc = (pngPath: string, updatedAt: string | null | undefined): string =>
+  qrSrcPrefix(pngPath) + encodeURIComponent(updatedAt ?? "");
+
+/** The two paths the page needs: the PNG it shows and the state it polls. */
+export type KbizQrPageRoutes = { png: string; state: string };
+
+const FONT_HREF = "https://fonts.googleapis.com/css2?family=Sarabun:wght@400;500;600;700&display=swap";
+
+export function renderKbizLoginQrPage(state: KbizQrState, routes: KbizQrPageRoutes): string {
   const copy = COPY[state.status] ?? COPY.error;
   const waiting = state.status === "waiting";
-  const imgAttr = waiting ? ` src="${esc(kbizQrImageSrc(state.updatedAt))}"` : "";
-  const boot = jsonForScript({ copy: COPY, state });
+  const imgAttr = waiting ? ` src="${esc(qrImageSrc(routes.png, state.updatedAt))}"` : "";
+  const boot = jsonForScript({ copy: COPY, state, routes: { state: routes.state, qrSrc: qrSrcPrefix(routes.png) } });
   return `<!doctype html>
 <html lang="th">
 <head>
@@ -75,7 +86,8 @@ export function renderKbizLoginQrPage(state: KbizQrState): string {
 <title>สแกน QR เข้าสู่ระบบ K BIZ</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="${FONT_HREF}" rel="stylesheet" media="print" onload="this.media='all'">
+<noscript><link href="${FONT_HREF}" rel="stylesheet"></noscript>
 <style>
   :root {
     font: 16px/1.55 "Sarabun", "Noto Sans Thai", system-ui, sans-serif;
@@ -174,6 +186,7 @@ export function renderKbizLoginQrPage(state: KbizQrState): string {
 (function () {
   var boot = JSON.parse(document.getElementById("qr-boot").textContent);
   var COPY = boot.copy;
+  var ROUTES = boot.routes;
   var card = document.getElementById("card");
   var img = document.getElementById("qr");
   var last = boot.state;
@@ -201,14 +214,17 @@ export function renderKbizLoginQrPage(state: KbizQrState): string {
     set("expires", when(state.expiresAt));
     set("updated", when(state.updatedAt));
     if (state.status === "waiting") {
-      img.setAttribute("src", "/kbiz/login-qr.png?t=" + encodeURIComponent(state.updatedAt || ""));
+      img.setAttribute("src", ROUTES.qrSrc + encodeURIComponent(state.updatedAt || ""));
     } else {
       img.removeAttribute("src");
     }
   }
 
   function poll() {
-    fetch("/kbiz/login-qr/state.json", { cache: "no-store", credentials: "same-origin" })
+    // A backgrounded tab is nobody's live view; stop polling until it is looked
+    // at again. The interval keeps running (a later handoff reuses the tab).
+    if (document.hidden) return;
+    fetch(ROUTES.state, { cache: "no-store", credentials: "same-origin" })
       .then(function (res) { return res.ok ? res.json() : null; })
       .then(function (state) {
         if (!state || typeof state.status !== "string") return;
@@ -221,6 +237,9 @@ export function renderKbizLoginQrPage(state: KbizQrState): string {
 
   apply(last);
   setInterval(poll, 5000);
+  // Returning to the tab must not mean up to 5 s of stale card — the skipped
+  // ticks above are made good the moment the page is looked at again.
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) poll(); });
 })();
 </script>
 </body>

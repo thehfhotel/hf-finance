@@ -20,19 +20,27 @@ driver for KBIZ (KBank Business Online), running on evergreen as a
   take `{ onQr: "handoff" | "refuse" }` and default to `"refuse"`, which throws
   `QrLoginRequiredError` the instant the bank lands on `loginQR.do` instead of
   waiting 60 s and crashing an item. `"handoff"` publishes the QR to
-  `KBIZ_QR_DIR` + Slack and waits 6.5 min for a human
-  (`lib/qr-login-core.ts` pure, `lib/qr-login.ts` driver; the 12×500 ms
-  post-navigation session probe both `gotoAuthenticated` and the handoff's
-  `confirmDashboard` run lives once, in `lib/session-probe.ts`). It runs in
-  exactly two places: `processBatch`'s warm-up (before the item loop, before
+  `KBIZ_QR_DIR` + Slack and waits 6.5 min for a human. Three files, one job:
+  `lib/qr-login-core.ts` (pure state machine; its one import is
+  `approval-wait.ts`), `lib/qr-login-files.ts` (fs-only — `QR_DIR`,
+  `current.png`/`state.json`, the stale-publication sweep; its `dir` params are
+  the test seam) and `lib/qr-login.ts` (the Page-bound driver, the only one
+  that pulls playwright). The 12×500 ms post-navigation session probe both
+  `gotoAuthenticated` and the handoff's `confirmDashboard` run lives once, in
+  `lib/session-probe.ts`; Slack has one voice, `lib/slack.ts`. The handoff runs
+  in exactly two places: `processBatch`'s warm-up (before the item loop, before
   any claim or arm-lock write, so an unscanned QR costs no item) and the
-  operator's `npm run login`. A failed handoff sets a 10-min cooldown
-  (`shouldRequestQr`) during which the batch is skipped silently — a warm-up
-  that failed for a NON-QR reason — including Chromium failing to launch,
-  which happens inside `withSession` before the callback — Slacks one masked
-  English line before it rethrows, so a batch can never stall invisibly. Never
-  screenshot the QR — decode `img.qrcode`'s `src` data URI — and never treat
-  the bank's own redirect as proof: confirm the dashboard.
+  operator's `npm run login` — each passes its own `reason`, which
+  `onQr: "handoff"` requires. A failed warm-up sets a 10-min cooldown
+  (`shouldAttemptLogin`) during which the batch is skipped silently; ONE catch
+  covers both halves — an unscanned QR posts the Thai timeout line and holds
+  the batch, any OTHER reason (including Chromium failing to launch, which
+  happens inside `withSession` before the callback) Slacks one masked English
+  line before it rethrows, so a batch can never stall invisibly. The stale-
+  publication sweep runs at handoff ENTRY, not at process start (payroll-form
+  downgrades a stale `waiting` at read time). Never screenshot the QR — decode
+  `img.qrcode`'s `src` data URI — and never treat the bank's own redirect as
+  proof: confirm the dashboard.
 - **Ambiguity is never auto-resolved.** Outcomes are four-way: success /
   confirmed-failed (retryable — the bank explicitly rejected it, nothing
   moved) / push-expired (retryable — the bank's own expiry modal, the ~6 min
@@ -72,8 +80,9 @@ driver for KBIZ (KBank Business Online), running on evergreen as a
   imports, a plain number for `now`, the page reached only through thunks — so
   `bun test` at the repo root, BEFORE kbiz-bot's node_modules even exist,
   proves the invariant (and R5: a slip-capture failure never downgrades a
-  bank-confirmed success); `arm-lock.ts` is fs-only; only
-  `transfer-other-flow.ts` / `process-queue.ts` touch playwright. Never blur
+  bank-confirmed success); `arm-lock.ts` and `qr-login-files.ts` are fs-only (both write through
+  `fs-atomic.ts`'s `writeAtomic`); only `transfer-other-flow.ts`,
+  `process-queue.ts`, `session*.ts` and `qr-login.ts` touch playwright. Never blur
   that split — a runtime playwright import in a pure or test file passes
   locally and breaks root CI.
 
