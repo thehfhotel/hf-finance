@@ -25,12 +25,12 @@ import { isUnauthenticatedUrl } from "./approval-wait";
  * tsx/esbuild's keepNames rewrites named inner functions inside an evaluate
  * callback into `__name(...)`, which does not exist in the browser.
  */
-export const SESSION_DEAD_SOURCE =
+const SESSION_DEAD_SOURCE =
   "Sorry[\\s\\S]+session has expired|session expired or you are signed in|เซสชัน(?:ของคุณ)?หมดอายุ|หมดเวลาการใช้งาน|เข้าสู่ระบบจากอุปกรณ์อื่น";
 
 /** 12 × 500 ms = 6 s, long enough to outlive the bank's async check. */
-export const STABILISE_POLLS = 12;
-export const STABILISE_STEP_MS = 500;
+const STABILISE_POLLS = 12;
+const STABILISE_STEP_MS = 500;
 
 /**
  * Poll the page for STABILISE_POLLS × STABILISE_STEP_MS.

@@ -130,18 +130,14 @@ describe("runQrHandoff — first QR", () => {
   });
 
   it("publishes the QR at t=0, not one poll later (the human's 5:55 is already running)", async () => {
-    let publishedAt = -1;
     const view = stubQrView([
       { atMs: 0, qrDataUri: pngDataUri() },
       { atMs: 2 * QR_POLL_MS, url: STUB_DASHBOARD_URL, qrDataUri: null },
     ]);
-    const write = view.writePng;
-    view.writePng = async (bytes) => {
-      if (publishedAt < 0) publishedAt = view.now();
-      return write(bytes);
-    };
     await run(view);
-    expect(publishedAt).toBe(0);
+    // `capturedAt` IS the publish moment — the state file and the PNG are
+    // written in the same breath, and the operator page counts down from it.
+    expect(Date.parse(view.states()[0]!.capturedAt!)).toBe(0);
   });
 });
 
@@ -319,18 +315,19 @@ describe("runQrHandoff — an unreadable QR", () => {
 const at = (rel: string) => fileURLToPath(new URL(rel, import.meta.url));
 
 describe("no playwright import (root CI runs bun test before kbiz-bot's node_modules exist)", () => {
-  it("qr-login-core.ts imports nothing at all — not playwright, not fs", () => {
-    const src = readFileSync(at("../src/lib/qr-login-core.ts"), "utf8");
-    expect(src).not.toMatch(/from\s+["']playwright["']/);
-    expect(src).not.toMatch(/^\s*import\s/m);
+  it("qr-login-core.ts imports nothing from playwright", () => {
+    expect(readFileSync(at("../src/lib/qr-login-core.ts"), "utf8")).not.toMatch(/from\s+["']playwright["']/);
+  });
+
+  it("qr-login-files.ts imports nothing from playwright", () => {
+    expect(readFileSync(at("../src/lib/qr-login-files.ts"), "utf8")).not.toMatch(/from\s+["']playwright["']/);
   });
 
   it("test/support/stub-qr-view.ts imports nothing from playwright", () => {
     expect(readFileSync(at("support/stub-qr-view.ts"), "utf8")).not.toMatch(/from\s+["']playwright["']/);
   });
 
-  it("the driver — and only the driver — is where playwright enters", () => {
-    // qr-login.ts may import it; nothing importable from a test may.
-    expect(readFileSync(at("../src/lib/qr-login.ts"), "utf8")).toMatch(/import type \{ Page \} from "playwright"/);
+  it("test/support/frame-clock.ts imports nothing from playwright", () => {
+    expect(readFileSync(at("support/frame-clock.ts"), "utf8")).not.toMatch(/from\s+["']playwright["']/);
   });
 });

@@ -11,8 +11,9 @@
  *
  * Same split as approval-wait.ts, for the same reason: root CI runs `bun test`
  * BEFORE kbiz-bot's node_modules exist, so this file (and everything under
- * test/) must never import "playwright", not even `import type`. The page,
- * the disk and Slack are reached only through the `QrLoginView` thunks;
+ * test/) must never import "playwright", not even `import type` — its one
+ * import is approval-wait.ts, pure for the same reason. The page, the disk
+ * and Slack are reached only through the `QrLoginView` thunks;
  * `now`/`sleep` are thunks too, so the full 6.5-min deadline runs in
  * microseconds under a virtual clock (test/support/stub-qr-view.ts).
  *
@@ -20,11 +21,18 @@
  * it never taps anything — the phone stays the gate, here as everywhere else.
  */
 
+// The one "are we still in the login funnel?" predicate, shared with the
+// approval wait and gotoAuthenticated. `loginQR.do` is an `/authen/` URL, so
+// it matches — that is exactly what keeps the loop below waiting.
+import { isUnauthenticatedUrl } from "./approval-wait";
+
 /** The URL the bank parks on while it waits for the scan. */
 export const isQrLoginUrl = (url: string) => /loginQR\.do/i.test(url);
 
-/** Still inside the unauthenticated login funnel (credentials OR QR page). */
-const isAuthenUrl = (url: string) => /\/authen\//.test(url);
+/** The bank's own id for the user field — the login form's proof-of-presence
+ *  marker. session.ts fills it; the handoff reads it to tell "the bank gave up
+ *  and showed the credentials form again" from "a QR is still on screen". */
+export const KBIZ_LOGIN_FORM_SELECTOR = "#userName";
 
 /** The page every logged-in check lands on. Shared so qr-login.ts's
  *  `confirmDashboard` and session.ts's `ensureLoggedIn` cannot drift apart —
@@ -47,7 +55,7 @@ export const QR_POLL_MS = 2_000;
 /** The bank's own countdown: "กรุณาทำรายการภายใน 05:55 นาที". */
 export const QR_WINDOW_MS = 5 * 60_000 + 55_000;
 /** A rotated QR re-pings Slack at most this often. */
-export const QR_NOTIFY_INTERVAL_MS = 60_000;
+const QR_NOTIFY_INTERVAL_MS = 60_000;
 /** After a failed handoff, the batch is skipped for this long. */
 export const QR_COOLDOWN_MS = 10 * 60_000;
 
@@ -122,12 +130,8 @@ export interface QrLoginView {
 export interface QrHandoffOptions {
   /** Goes into the state file and every Slack line. */
   reason: string;
-  /** Where a human opens the QR. */
-  pageUrl?: string;
-  timeoutMs?: number;
-  pollMs?: number;
-  notifyIntervalMs?: number;
-  windowMs?: number;
+  /** Where a human opens the QR. The driver resolves the env override. */
+  pageUrl: string;
 }
 
 // ── Slack text (contract-pinned, Thai) ────────────────────────────────────
@@ -198,39 +202,36 @@ export function decodeQrDataUri(dataUri: string): Uint8Array {
 // ── Cooldown ──────────────────────────────────────────────────────────────
 
 /**
- * May the batch ask for a scan right now? False only while a failed handoff's
+ * May the batch try to log in right now? False only while a failed login's
  * cooldown is still running — that is the whole "skip the batch quietly, no
  * second Slack ping" rule, expressed as a pure function so it is testable
- * without a queue, a browser or a clock.
+ * without a queue, a browser or a clock. It governs the whole warm-up, not
+ * just the scan: an unscanned QR and a bank outage back off the same way.
  */
-export function shouldRequestQr(
+export function shouldAttemptLogin(
   now: number,
-  lastQrFailAt: number | null | undefined,
+  lastLoginFailAt: number | null | undefined,
   cooldownMs: number = QR_COOLDOWN_MS,
 ): boolean {
-  if (lastQrFailAt === null || lastQrFailAt === undefined) return true;
-  return now - lastQrFailAt >= cooldownMs;
+  if (lastLoginFailAt === null || lastLoginFailAt === undefined) return true;
+  return now - lastLoginFailAt >= cooldownMs;
 }
 
 // ── State builders ────────────────────────────────────────────────────────
 
 const iso = (ms: number) => new Date(ms).toISOString();
 
-export function waitingState(opts: {
-  reason: string;
-  attempt: number;
-  capturedAtMs: number;
-  windowMs?: number;
-}): QrLoginState {
-  const windowMs = opts.windowMs ?? QR_WINDOW_MS;
+function waitingState(opts: { reason: string; attempt: number; capturedAtMs: number }): QrLoginState {
   return {
     status: "waiting",
     reason: opts.reason,
     attempt: opts.attempt,
     capturedAt: iso(opts.capturedAtMs),
-    expiresAt: iso(opts.capturedAtMs + windowMs),
+    expiresAt: iso(opts.capturedAtMs + QR_WINDOW_MS),
     updatedAt: iso(opts.capturedAtMs),
-    message: maskQrMessage(`QR #${opts.attempt} ready — scan it with the K BIZ app`),
+    // Not masked: this module wrote it, and it is a constant plus a counter.
+    // terminalState's message is the one that carries caller text.
+    message: `QR #${opts.attempt} ready — scan it with the K BIZ app`,
   };
 }
 
@@ -262,93 +263,82 @@ export function terminalState(opts: {
 
 /**
  * Publish the bank's QR, wait for a human to scan it, prove the session is up.
- *
  * Reads first and sleeps afterwards (the opposite of waitForApproval): the QR
  * is already on screen when we arrive and the human's 5:55 is already running,
  * so the first publish happens at t≈0, not at t≈2 s.
  *
- * Precedence per poll:
- *   1. the URL left /authen         → confirmDashboard() → `ok`, return
- *   2. a FRESH data URI             → decode, write PNG + `waiting`, notify
- *   3. the credentials form is back
- *      AND no QR on screen          → `expired`, throw QrLoginTimeoutError
- *   4. deadline                     → `expired`, throw QrLoginTimeoutError
- *
- * (1) outranks everything because a confirmed dashboard is the only positive
- * proof this function exists to obtain. (2) outranks (3) — the CR's order —
- * because a QR that is on screen is a QR a human can still scan: if the bank's
- * loginQR.do ever kept a visible `#userName` anywhere in its DOM, checking the
- * form first would file `expired` on the very first poll and no code would
- * ever be published. A decode failure is `error` + throw: publishing an
- * unverified blob would put an unknown image on a page an operator is told to
- * trust.
- *
- * Any OTHER throw (a full disk, a webhook that rejects) still takes the PNG
- * down on the way out: `current.png` on disk means "a live QR is waiting", and
- * an interrupted handoff must not leave that claim standing.
+ * The precedence the numbered comments below mark is load-bearing. (1) outranks
+ * everything because a confirmed dashboard is the only positive proof this
+ * function exists to obtain. (2) outranks (3) — the CR's order — because a QR
+ * that is on screen is a QR a human can still scan: if the bank's loginQR.do
+ * ever kept a visible `#userName` anywhere in its DOM, checking the form first
+ * would file `expired` on the very first poll and no code would ever be
+ * published.
  */
 export async function runQrHandoff(view: QrLoginView, opts: QrHandoffOptions): Promise<void> {
-  const timeoutMs = opts.timeoutMs ?? QR_HANDOFF_TIMEOUT_MS;
-  const pollMs = opts.pollMs ?? QR_POLL_MS;
-  const notifyIntervalMs = opts.notifyIntervalMs ?? QR_NOTIFY_INTERVAL_MS;
-  const windowMs = opts.windowMs ?? QR_WINDOW_MS;
-  const pageUrl = opts.pageUrl ?? DEFAULT_QR_PAGE_URL;
-  const reason = opts.reason;
-
+  const { reason, pageUrl } = opts;
   const started = view.now();
   let attempt = 0;
   let lastDataUri: string | null = null;
-  let lastNotifyAt: number | null = null;
+  let lastNotifyAt = -Infinity;
 
   const settle = async (status: Exclude<QrLoginStatus, "waiting">, message: string) => {
     await view.removePng();
     await view.writeState(terminalState({ status, reason, attempt, atMs: view.now(), message }));
   };
 
+  /** A decode failure is `error` + throw: publishing an unverified blob would
+   *  put an unknown image on a page an operator is told to trust. */
+  const decodeOrAbort = async (dataUri: string): Promise<Uint8Array> => {
+    try {
+      return decodeQrDataUri(dataUri);
+    } catch (e) {
+      await settle("error", `Could not read the QR image: ${(e as Error).message}`);
+      throw new Error(`QR login handoff failed: ${(e as Error).message}`);
+    }
+  };
+
+  const publishFreshQr = async (dataUri: string) => {
+    const bytes = await decodeOrAbort(dataUri);
+    lastDataUri = dataUri;
+    attempt += 1;
+    const capturedAtMs = view.now();
+    await view.writePng(bytes);
+    await view.writeState(waitingState({ reason, attempt, capturedAtMs }));
+    if (capturedAtMs - lastNotifyAt >= QR_NOTIFY_INTERVAL_MS) {
+      lastNotifyAt = capturedAtMs;
+      await view.notify(qrWaitingMessage({ reason, attempt, pageUrl }));
+    }
+  };
+
   try {
-    while (view.now() - started < timeoutMs) {
+    while (view.now() - started < QR_HANDOFF_TIMEOUT_MS) {
       // (1) The bank redirects itself away from /authen the moment the app
       //     confirms. Never trust the redirect alone — prove the dashboard.
-      if (!isAuthenUrl(view.url())) {
-        if (await view.confirmDashboard()) {
-          await settle("ok", "Logged in");
-          await view.notify(qrSuccessMessage(reason));
-          return;
-        }
-        // Not (yet) a real session — fall through and keep waiting; the bank
-        // may still be mid-redirect, and the deadline below bounds this.
-      } else {
-        // (2) A fresh QR (first, or rotated). Read BEFORE judging the form:
-        //     a code on screen is a code a human can still scan.
-        const dataUri = await view.qrDataUri().catch(() => null);
-        if (dataUri && dataUri !== lastDataUri) {
-          let bytes: Uint8Array;
-          try {
-            bytes = decodeQrDataUri(dataUri);
-          } catch (e) {
-            await settle("error", `Could not read the QR image: ${(e as Error).message}`);
-            throw new Error(`QR login handoff failed: ${(e as Error).message}`);
-          }
-          lastDataUri = dataUri;
-          attempt += 1;
-          const capturedAtMs = view.now();
-          await view.writePng(bytes);
-          await view.writeState(waitingState({ reason, attempt, capturedAtMs, windowMs }));
-          const firstQr = lastNotifyAt === null;
-          if (firstQr || capturedAtMs - lastNotifyAt! >= notifyIntervalMs) {
-            lastNotifyAt = capturedAtMs;
-            await view.notify(qrWaitingMessage({ reason, attempt, pageUrl }));
-          }
-        } else if (dataUri === null && (await view.loginFormVisible())) {
-          // (3) No QR anywhere AND the credentials form is back: the bank
-          //     abandoned this round. With a QR still rendered this is not a
-          //     bail-out — the human's window is still open.
-          await settle("expired", "The bank returned to the login form before any scan");
-          throw new QrLoginTimeoutError("K BIZ returned to the credentials form before the QR was scanned");
-        }
+      const authenticatedUrl = !isUnauthenticatedUrl(view.url());
+      if (authenticatedUrl && (await view.confirmDashboard())) {
+        await settle("ok", "Logged in");
+        await view.notify(qrSuccessMessage(reason));
+        return;
       }
 
-      await view.sleep(pollMs);
+      // Off /authen but not (yet) a real session: the bank may still be
+      // mid-redirect, so keep waiting — the deadline bounds it — and do not
+      // go looking for a QR on a page that has left the login funnel.
+      const dataUri = authenticatedUrl ? null : await view.qrDataUri().catch(() => null);
+      if (dataUri && dataUri !== lastDataUri) {
+        // (2) A fresh QR (first, or rotated). Read BEFORE judging the form:
+        //     a code on screen is a code a human can still scan.
+        await publishFreshQr(dataUri);
+      } else if (!authenticatedUrl && dataUri === null && (await view.loginFormVisible())) {
+        // (3) No QR anywhere AND the credentials form is back: the bank
+        //     abandoned this round. With a QR still rendered this is not a
+        //     bail-out — the human's window is still open.
+        await settle("expired", "The bank returned to the login form before any scan");
+        throw new QrLoginTimeoutError("K BIZ returned to the credentials form before the QR was scanned");
+      }
+
+      await view.sleep(QR_POLL_MS);
     }
   } catch (e) {
     // `settle()` already removed the PNG on every transition it owns; this

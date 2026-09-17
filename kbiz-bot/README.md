@@ -240,7 +240,9 @@ does not help; wait for the next ask, or pre-warm (below).
 The page is the *only* place the code is published: the bot writes
 `current.png` + `state.json` into `KBIZ_QR_DIR`, the PNG decoded from the login
 page's own `img.qrcode` data URI. It is never a screenshot, and the QR file is
-deleted the moment the handoff ends.
+deleted the moment the handoff ends. Code map: `lib/qr-login-core.ts` decides
+(pure), `lib/qr-login-files.ts` writes those two files, `lib/qr-login.ts`
+drives the browser, `lib/slack.ts` posts the lines.
 
 **Pre-warming before a known batch.** The watch container holds the browser
 profile, so you cannot just run `npm run login` beside it. Use the wrapper —

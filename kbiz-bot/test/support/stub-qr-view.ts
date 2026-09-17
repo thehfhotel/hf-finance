@@ -1,22 +1,19 @@
 /**
- * Playwright-free `QrLoginView` stub with a virtual clock — the same shape as
- * stub-approval-page.ts, for the same reason: `runQrHandoff`'s full 6.5-min
- * deadline then runs in microseconds and deterministically. Must not import
- * "playwright" (root CI runs `bun test` before kbiz-bot's node_modules exist).
- *
- * The clock advances ONLY inside `sleep()`. Nothing else may move it: a test
- * that could nudge time from a read would stop proving the loop's cadence.
+ * Playwright-free `QrLoginView` stub on the shared virtual clock
+ * (frame-clock.ts) — the same shape as stub-approval-page.ts, for the same
+ * reason: `runQrHandoff`'s full 6.5-min deadline then runs in microseconds and
+ * deterministically. Must not import "playwright" (root CI runs `bun test`
+ * before kbiz-bot's node_modules exist).
  */
 
-import type { QrLoginState, QrLoginView } from "../../src/lib/qr-login-core";
+import { KBIZ_DASHBOARD_URL, type QrLoginState, type QrLoginView } from "../../src/lib/qr-login-core";
+import { frameClock } from "./frame-clock";
 
-const QR_URL = "https://kbiz.kasikornbank.com/authen/loginQR.do?cmd=stub";
-const LOGIN_URL = "https://kbiz.kasikornbank.com/authen/login.jsp?lang=th";
-const DASHBOARD_URL = "https://kbiz.kasikornbank.com/menu/account/account-summary";
-
-export const STUB_QR_URL = QR_URL;
-export const STUB_LOGIN_URL = LOGIN_URL;
-export const STUB_DASHBOARD_URL = DASHBOARD_URL;
+export const STUB_QR_URL = "https://kbiz.kasikornbank.com/authen/loginQR.do?cmd=stub";
+export const STUB_LOGIN_URL = "https://kbiz.kasikornbank.com/authen/login.jsp?lang=th";
+/** The real constant, not a re-typed literal: a drift here would make the
+ *  stub's "the bank redirected itself" frame a URL the core never sees. */
+export const STUB_DASHBOARD_URL = KBIZ_DASHBOARD_URL;
 
 /** A 1×1 PNG, base64 — real magic bytes, so decodeQrDataUri accepts it. */
 export const PNG_1PX_B64 =
@@ -43,41 +40,25 @@ export interface QrStubView extends QrLoginView {
   dashboardChecks(): number;
 }
 
-export function stubQrView(
-  frames: QrStubFrame[],
-  opts?: { confirmDashboard?: boolean | ((t: number) => boolean) },
-): QrStubView {
-  const sorted = [...frames].sort((a, b) => a.atMs - b.atMs);
-  let t = 0;
+export function stubQrView(frames: QrStubFrame[], opts?: { confirmDashboard?: boolean }): QrStubView {
+  const clock = frameClock(frames);
   const pngs: Uint8Array[] = [];
   const states: QrLoginState[] = [];
   const notes: string[] = [];
   let removals = 0;
   let dashboardChecks = 0;
 
-  /** The latest frame with atMs <= t, or undefined before the first frame. */
-  const latestFrame = (): QrStubFrame | undefined => {
-    let latest: QrStubFrame | undefined;
-    for (const f of sorted) {
-      if (f.atMs <= t) latest = f;
-      else break;
-    }
-    return latest;
-  };
-
   const confirm = opts?.confirmDashboard ?? true;
 
   return {
-    now: () => t,
-    sleep: async (ms: number) => {
-      t += ms;
-    },
-    url: () => latestFrame()?.url ?? QR_URL,
-    qrDataUri: async () => latestFrame()?.qrDataUri ?? null,
-    loginFormVisible: async () => latestFrame()?.loginFormVisible ?? false,
+    now: clock.now,
+    sleep: clock.sleep,
+    url: () => clock.latest()?.url ?? STUB_QR_URL,
+    qrDataUri: async () => clock.latest()?.qrDataUri ?? null,
+    loginFormVisible: async () => clock.latest()?.loginFormVisible ?? false,
     confirmDashboard: async () => {
       dashboardChecks++;
-      return typeof confirm === "function" ? confirm(t) : confirm;
+      return confirm;
     },
     writePng: async (bytes) => {
       pngs.push(bytes);
@@ -91,7 +72,7 @@ export function stubQrView(
     notify: async (text) => {
       notes.push(text);
     },
-    elapsed: () => t,
+    elapsed: clock.now,
     pngWrites: () => pngs,
     states: () => states,
     pngRemovals: () => removals,

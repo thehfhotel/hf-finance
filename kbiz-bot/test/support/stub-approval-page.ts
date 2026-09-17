@@ -1,11 +1,12 @@
 /**
- * Playwright-free `ApprovalView` stub with a virtual clock, so
- * `waitForApproval`'s full 6.5-min timeout runs in microseconds and
- * deterministically. Must not import "playwright" — root CI runs `bun test`
- * before kbiz-bot's node_modules exist.
+ * Playwright-free `ApprovalView` stub on the shared virtual clock
+ * (frame-clock.ts), so `waitForApproval`'s full 6.5-min timeout runs in
+ * microseconds and deterministically. Must not import "playwright" — root CI
+ * runs `bun test` before kbiz-bot's node_modules exist.
  */
 
 import type { ApprovalView } from "../../src/lib/approval-wait";
+import { frameClock } from "./frame-clock";
 
 export interface StubFrame {
   atMs: number;
@@ -20,31 +21,18 @@ export function stubApprovalView(
   opts?: { startUrl?: string },
 ): ApprovalView & { elapsed(): number; reads(): number } {
   const startUrl = opts?.startUrl ?? DEFAULT_START_URL;
-  const sorted = [...frames].sort((a, b) => a.atMs - b.atMs);
-  let t = 0;
+  const clock = frameClock(frames);
   let readCount = 0;
 
-  /** The latest frame with atMs <= t, or undefined before the first frame. */
-  const latestFrame = (): StubFrame | undefined => {
-    let latest: StubFrame | undefined;
-    for (const f of sorted) {
-      if (f.atMs <= t) latest = f;
-      else break;
-    }
-    return latest;
-  };
-
   return {
-    now: () => t,
-    url: () => latestFrame()?.url ?? startUrl,
+    now: clock.now,
+    url: () => clock.latest()?.url ?? startUrl,
     bodyText: async () => {
       readCount++;
-      return latestFrame()?.text ?? "";
+      return clock.latest()?.text ?? "";
     },
-    sleep: async (ms: number) => {
-      t += ms;
-    },
-    elapsed: () => t,
+    sleep: clock.sleep,
+    elapsed: clock.now,
     reads: () => readCount,
   };
 }
