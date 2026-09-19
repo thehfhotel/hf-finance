@@ -391,6 +391,9 @@ const app = new Elysia()
             salary: t.Number({ minimum: 0 }),
             socialSecurity: t.Number({ minimum: 0 }),
             savings: t.Number({ minimum: 0 }),
+            // กองทุนสงเคราะห์ลูกจ้าง — the employee's withheld share. The
+            // employer's match is derived from it, so it is never posted.
+            welfareFund: t.Number({ minimum: 0 }),
             advance: t.Number({ minimum: 0 }),
             loan: t.Number({ minimum: 0 }),
             interest: t.Number({ minimum: 0 }),
