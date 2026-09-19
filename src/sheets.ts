@@ -2,6 +2,7 @@ import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { listAccounts, normalizeAccountNumber } from "./store";
 import { loadEmployeeDefaults, type EmployeeDefault } from "./roster-data";
+import { ratesFor, salaryLinkedAmounts } from "./payroll-rates";
 
 const SHEETS_DIR = process.env.SHEETS_DIR ?? "data/sheets";
 
@@ -16,6 +17,11 @@ export type SheetRow = {
   salary: number;
   socialSecurity: number;
   savings: number;
+  // กองทุนสงเคราะห์ลูกจ้าง — the EMPLOYEE's share only, withheld like any other
+  // deduction. The employer's matching เงินสมทบ is the same rate on the same
+  // salary, so it is DERIVED for the worksheet's employer column, never stored:
+  // one number can't drift from the other if there's only one number.
+  welfareFund: number;
   advance: number;
   loan: number;
   interest: number;
@@ -89,12 +95,22 @@ function emptyRow(a: { id: string; accountNumber: string; accountName: string })
     nickname: d?.nickname ?? "",
     position: d?.position ?? "",
     salary: d?.salary ?? 0,
-    socialSecurity: 0, savings: 0, advance: 0, loan: 0,
+    socialSecurity: 0, savings: 0, welfareFund: 0, advance: 0, loan: 0,
     interest: 0, roomCost: 0, leave: 0, otherDeduction: 0,
     commission: 0, breakfast: 0, ot: 0, otherAddition: 0,
     note: "",
   };
 }
+
+// Every numeric column of a SheetRow, in worksheet order: salary, then the
+// deductions, then the additions. Used only by normalize() — the worksheet
+// keeps its own display order in views/worksheet.ts.
+const NUMERIC_FIELDS: (keyof SheetRow)[] = [
+  "salary",
+  "socialSecurity", "savings", "welfareFund", "advance", "loan",
+  "interest", "roomCost", "leave", "otherDeduction",
+  "commission", "breakfast", "ot", "otherAddition",
+];
 
 // Backfill new fields on rows persisted before they existed. For old rows
 // where the bank prefix was embedded in accountNumber (e.g. "KTB-957-..."),
@@ -102,6 +118,18 @@ function emptyRow(a: { id: string; accountNumber: string; accountName: string })
 // from EMPLOYEE_DEFAULTS the first time we see a row with all three blank
 // — avoids clobbering rows the operator has already edited.
 function normalize(row: any): SheetRow {
+  // Sheets already written to data/sheets/*.json have no key at all for a
+  // column added later (welfareFund is the first such deduction), so the row
+  // arrives with `undefined` and every sum touching it — takeHome, the
+  // worksheet totals — renders NaN in the browser. Nothing else coerced these
+  // fields, so a hand-edited JSON holding a string or null did the same.
+  // Force the whole numeric block to a finite number and let 0 be the default:
+  // a missing deduction is an amount of zero, which is what the old sheets
+  // meant by leaving it out.
+  for (const f of NUMERIC_FIELDS) {
+    const n = Number(row[f]);
+    row[f] = Number.isFinite(n) ? n : 0;
+  }
   if (typeof row.nickname !== "string") row.nickname = "";
   if (typeof row.position !== "string") row.position = "";
   if (typeof row.bank !== "string") {
@@ -155,22 +183,38 @@ async function latestPriorSheet(period: string): Promise<Sheet | null> {
 }
 
 // A fresh row for a NEW cycle, seeded from the same account's prior-cycle row:
-// carry the salary forward and recompute ประกันสังคม 5% / เงินสะสม 5%; all
+// carry the salary forward and recompute the salary-linked deductions; all
 // one-time fields (advance, loan, OT, …) and the note start at 0/blank.
-// ประกันสังคม was 3% through the 2026-06 cycle; 5% from 2026-07 on. No 15,000฿
-// wage-base cap is applied (all salaries are below it — revisit if that changes).
-// Keep in sync with LINKED_RATES in views/worksheet.ts.
-function seededRow(a: { id: string; accountNumber: string; accountName: string }, prior: SheetRow): SheetRow {
+//
+// The rates come from the TARGET period, not from "now" and not from the prior
+// row — src/payroll-rates.ts is the single source of truth for which era a
+// cycle belongs to, and views/worksheet.ts resolves the very same table in the
+// browser. That is what keeps 2026-09 on เงินสะสม 5% / EWF 0% while 2026-10
+// opens on 4.75% + 0.25%, instead of a bare constant re-rating whichever cycle
+// happens to be reopened.
+//
+// No 15,000฿ wage-base cap is applied to ประกันสังคม (all salaries are below
+// it — revisit if that changes); the EWF has no wage ceiling at all.
+function seededRow(
+  a: { id: string; accountNumber: string; accountName: string },
+  prior: SheetRow,
+  period: string,
+): SheetRow {
   const base = emptyRow(a); // identity + EMPLOYEE_DEFAULTS fallback for new accounts
   const salary = Number(prior.salary) || 0;
+  // salaryLinkedAmounts, not three independent roundings: เงินสะสม has to
+  // absorb the carve-out's rounding remainder so the employee's total stays
+  // exactly 5% of salary. The browser's auto-fill mirrors this same helper.
+  const linked = salaryLinkedAmounts(salary, ratesFor(period));
   return {
     ...base,
     bank: prior.bank || base.bank,
     nickname: prior.nickname || base.nickname,
     position: prior.position || base.position,
     salary,
-    socialSecurity: Math.round(salary * 0.05 * 100) / 100,
-    savings: Math.round(salary * 0.05 * 100) / 100,
+    socialSecurity: linked.socialSecurity,
+    savings: linked.savings,
+    welfareFund: linked.welfareFund,
   };
 }
 
@@ -204,8 +248,9 @@ export async function loadSheet(period: string): Promise<Sheet> {
   // a locked past cycle keeps whatever it was paid out with.
   const refreshNames = !isPastPeriod(period);
   // For a brand-new sheet, seed each fresh row from the most recent prior cycle
-  // (carry salary + recompute 5%/5%). Existing sheets are never reseeded, so a
-  // value the user cleared stays cleared.
+  // (carry salary forward, recompute the salary-linked deductions at THIS
+  // period's rates). Existing sheets are never reseeded, so a value the user
+  // cleared stays cleared.
   const seed = existing ? null : new Map((await latestPriorSheet(period))?.rows.map((r) => [r.accountId, r]) ?? []);
   for (const a of accounts) {
     const number = normalizeAccountNumber(a.accountNumber);
@@ -224,7 +269,7 @@ export async function loadSheet(period: string): Promise<Sheet> {
     // keeping the one they typed — that kept row still deserves to be linked.
     if (dismissed.has(a.id)) continue;
     const prior = seed?.get(a.id);
-    sheet.rows.push(prior ? seededRow(a, prior) : emptyRow(a));
+    sheet.rows.push(prior ? seededRow(a, prior, period) : emptyRow(a));
   }
   return sheet;
 }
@@ -244,8 +289,11 @@ export async function saveSheet(period: string, input: Omit<Sheet, "period" | "u
 }
 
 export function takeHome(r: SheetRow): number {
+  // welfareFund is the employee's own withholding, so it belongs here. The
+  // employer's matching เงินสมทบ deliberately does NOT: it is the hotel's cost
+  // on top of the payroll, never money taken off anyone's pay.
   const deductions =
-    r.socialSecurity + r.savings + r.advance + r.loan +
+    r.socialSecurity + r.savings + r.welfareFund + r.advance + r.loan +
     r.interest + r.roomCost + r.leave + r.otherDeduction;
   const additions = r.commission + r.breakfast + r.ot + r.otherAddition;
   return Math.round((r.salary - deductions + additions) * 100) / 100;

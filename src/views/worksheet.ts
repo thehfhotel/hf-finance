@@ -1,5 +1,10 @@
 import { ZOOM_HTML } from "./zoom";
 import { loadSavingsBalance } from "../roster-data";
+// Serialised into the client script below so the browser resolves the SAME
+// period-gated rate table the server does (see src/payroll-rates.ts). Never
+// retype a rate into the page — a divergence here would silently re-rate a
+// cycle on screen while the server saved something else.
+import { RATE_ERAS, EWF_START_PERIOD } from "../payroll-rates";
 
 export const WORKSHEET_HTML = `<!doctype html>
 <html lang="th">
@@ -125,6 +130,17 @@ export const WORKSHEET_HTML = `<!doctype html>
   table.sheet th.deduct, table.sheet td.deduct { background: color-mix(in srgb, var(--hf-warning) 8%, white); }
   table.sheet th.add, table.sheet td.add { background: color-mix(in srgb, var(--hf-success) 8%, white); }
   table.sheet th.calc, table.sheet td.calc { background: var(--hf-brand-50); font-weight: 600; }
+  /* นายจ้างสมทบ — the employer's matching กองทุนสงเคราะห์ลูกจ้าง contribution.
+     It is DERIVED from the row's กองทุนสงเคราะห์ฯ deduction and is the
+     company's money, never the employee's, so it is tinted apart from the
+     .calc columns (which are all employee-side totals) and rendered as plain
+     text — there is deliberately no input in this cell. Declared after .calc
+     so it wins the background on the shared "calc employer-match" class. */
+  table.sheet th.employer-match, table.sheet td.employer-match {
+    background: color-mix(in srgb, var(--hf-info) 8%, white);
+    color: var(--hf-info);
+  }
+  table.sheet tbody tr:hover td.employer-match { background: color-mix(in srgb, var(--hf-info) 14%, white); }
   table.sheet td input.num { width: 100px; text-align: right; font-variant-numeric: tabular-nums; padding: 4px 6px; }
   table.sheet td input[type="text"].note { width: 220px; }
   table.sheet td input.sm-text { width: 100%; padding: 4px 6px; min-width: 50px; }
@@ -367,6 +383,10 @@ export const WORKSHEET_HTML = `<!doctype html>
   #reportRoot.mode-table th.deduct, #reportRoot.mode-table td.deduct { background: color-mix(in srgb, var(--hf-warning) 8%, white); }
   #reportRoot.mode-table th.add,    #reportRoot.mode-table td.add    { background: color-mix(in srgb, var(--hf-success) 8%, white); }
   #reportRoot.mode-table th.calc,   #reportRoot.mode-table td.calc   { background: var(--hf-brand-50); font-weight: 600; }
+  /* Employer's matching EWF contribution — same "not the employee's money"
+     tint as the editable worksheet. After .calc so it wins the background. */
+  #reportRoot.mode-table th.employer-match,
+  #reportRoot.mode-table td.employer-match { background: color-mix(in srgb, var(--hf-info) 8%, white); }
   #reportRoot.mode-table thead th.frozen { background: var(--hf-panel-tint); }
   #reportRoot.mode-table tbody td.frozen { background: var(--hf-panel); }
   #reportRoot.mode-table tfoot td.frozen { background: var(--hf-zebra); }
@@ -467,6 +487,16 @@ export const WORKSHEET_HTML = `<!doctype html>
     background: var(--hf-brand-50); border: 1px solid var(--hf-brand-500); border-radius: 6px;
     margin-bottom: 12px; color: var(--hf-brand-700); font-size: 14px;
   }
+  /* กองทุนสงเคราะห์ลูกจ้าง remittance summary (below the table). Rendered only
+     for cycles the fund applies to — see updateEwfRemittance(). */
+  #ewfRemit .ewf-grid { display: flex; gap: 28px; align-items: flex-end; flex-wrap: wrap; }
+  #ewfRemit .ewf-line { display: flex; flex-direction: column; gap: 2px; }
+  #ewfRemit .ewf-line .lbl { font-size: 13px; color: var(--hf-text-muted); }
+  #ewfRemit .ewf-line .val { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  #ewfRemit .ewf-line.grand .val { font-size: 22px; color: var(--hf-brand-500); }
+  #ewfRemit .ewf-due { margin-left: auto; font-size: 14px; font-weight: 600; color: var(--hf-warning); }
+  #ewfRemit .ewf-note { margin-top: 8px; font-size: 12px; color: var(--hf-text-muted); }
+
   body.snap .snap-banner strong { color: var(--hf-brand-500); }
   body.snap .snap-banner a { color: var(--hf-brand-500); margin-left: auto; }
   .snap-banner { display: none; }
@@ -557,8 +587,9 @@ export const WORKSHEET_HTML = `<!doctype html>
       <th rowspan="3" class="sticky-l" data-col="nickname" style="min-width:70px">ชื่อเล่น</th>
       <th rowspan="3" class="sticky-l" data-col="position" style="min-width:90px">ตำแหน่ง</th>
       <th rowspan="3" class="sticky-l" data-col="salary" style="min-width:110px">เงินเดือน</th>
-      <th colspan="8" class="deduct" id="anchor-deduct">รายการหัก</th>
+      <th colspan="9" class="deduct" id="anchor-deduct">รายการหัก</th>
       <th rowspan="3" class="calc">รวมรายการหัก</th>
+      <th rowspan="3" class="calc employer-match" title="เงินสมทบที่นายจ้างจ่ายเพิ่ม — ไม่ได้หักจากลูกจ้าง และไม่รวมอยู่ในรวมรายการหัก">นายจ้างสมทบ<span class="hint" id="hintEmployerMatch">&nbsp;</span></th>
       <th colspan="2" class="add" id="anchor-add">รับอื่นๆ</th>
       <th rowspan="3" class="add">ค่าโอที</th>
       <th rowspan="3" class="add">รวมรับอื่นๆ</th>
@@ -566,8 +597,13 @@ export const WORKSHEET_HTML = `<!doctype html>
       <th rowspan="3">หมายเหตุ</th>
     </tr>
     <tr>
-      <th rowspan="2" class="deduct">ประกันสังคม<span class="hint">5%</span></th>
-      <th rowspan="2" class="deduct">เงินสะสม<span class="hint">5%</span></th>
+      <!-- The three rate hints below are filled by applyRateHints() from the
+           loaded cycle's rates — the percentages MOVE (เงินสะสม 5% → 4.75%
+           from 2026-10, with the 0.25% carved out into กองทุนสงเคราะห์ฯ), so
+           nothing here may be a literal. -->
+      <th rowspan="2" class="deduct">ประกันสังคม<span class="hint" id="hintSocialSecurity">&nbsp;</span></th>
+      <th rowspan="2" class="deduct">เงินสะสม<span class="hint" id="hintSavings">&nbsp;</span></th>
+      <th rowspan="2" class="deduct" title="กองทุนสงเคราะห์ลูกจ้าง — หักจากลูกจ้างและนำส่งกรมสวัสดิการและคุ้มครองแรงงาน">กองทุนสงเคราะห์ฯ<span class="hint" id="hintWelfareFund">&nbsp;</span></th>
       <th rowspan="2" class="deduct">เบิกล่วงหน้า</th>
       <th colspan="4" class="deduct">อื่นๆ</th>
       <th rowspan="2" class="deduct">หักคอมมิชชั่น</th>
@@ -594,6 +630,30 @@ export const WORKSHEET_HTML = `<!doctype html>
   <button type="button" id="restoreAll" hidden style="margin-left:10px; padding:8px 14px; border:1px dashed var(--hf-text-muted); background:var(--hf-panel); border-radius:4px; cursor:pointer; color:var(--hf-text); font-size:14px;">ดึงพนักงานจากระบบเงินเดือน KBANK (<span id="restoreCount">0</span>)</button>
 </div>
 
+<!-- กองทุนสงเคราะห์ลูกจ้าง remittance summary. Both halves go to
+     กรมสวัสดิการและคุ้มครองแรงงาน together, so the operator needs the combined
+     figure and the deadline in one place. Hidden outright for any cycle before
+     EWF_START_PERIOD — see updateEwfRemittance(). -->
+<fieldset id="ewfRemit" style="margin-top:18px" hidden>
+  <legend>กองทุนสงเคราะห์ลูกจ้าง &middot; ยอดนำส่ง</legend>
+  <div class="ewf-grid">
+    <div class="ewf-line">
+      <span class="lbl">หักจากลูกจ้าง (<span id="ewfEmployeeRate">—</span>)</span>
+      <span class="val" id="ewfEmployeeTotal">0.00</span>
+    </div>
+    <div class="ewf-line">
+      <span class="lbl">นายจ้างสมทบ (<span id="ewfEmployerRate">—</span>)</span>
+      <span class="val" id="ewfEmployerTotal">0.00</span>
+    </div>
+    <div class="ewf-line grand">
+      <span class="lbl">รวมนำส่งกองทุน</span>
+      <span class="val" id="ewfCombinedTotal">0.00</span>
+    </div>
+    <div class="ewf-due" id="ewfDue"></div>
+  </div>
+  <div class="ewf-note">เงินสมทบของนายจ้างเป็นเงินเพิ่มจากบริษัท ไม่ได้หักจากลูกจ้าง และไม่รวมอยู่ในยอดรวมรายการหักหรือเงินเดือนสุทธิ</div>
+</fieldset>
+
 <fieldset style="margin-top:18px">
   <legend>หมายเหตุท้ายตาราง</legend>
   <textarea id="generalNotes" placeholder="เช่น สรุปยอดคอมฯ, รายการเฉพาะกิจ, พนักงานที่ลา ฯลฯ"></textarea>
@@ -605,12 +665,64 @@ export const WORKSHEET_HTML = `<!doctype html>
 <script src="/static/flatpickr-th.js"></script>
 <script src="/static/html2canvas.js"></script>
 <script>
+// ── Period-gated rates ──────────────────────────────────────────────────
+// RATE_ERAS below is the SERVER's table (src/payroll-rates.ts), serialised
+// into the page at module load — not a copy retyped for the browser. The
+// three lookups mirror the server's semantics exactly: newest era first, a
+// plain string >= compare on "YYYY-MM". Change a rate in payroll-rates.ts and
+// both sides move together; there is no percentage literal on this page.
+const RATE_ERAS = ${JSON.stringify(RATE_ERAS)};
+const EWF_START_PERIOD = ${JSON.stringify(EWF_START_PERIOD)};
+function ratesFor(period) {
+  const p = String(period == null ? "" : period);
+  // Mirrors ratesFor in src/payroll-rates.ts, guard included: letters sort
+  // above digits, so without the format test a junk period would resolve to
+  // the NEWEST era instead of the floor.
+  // NOTE the doubled backslashes: this whole page is a template literal, so
+  // \\d is what reaches the browser as \d. A single one would emit /^d{4}-d{2}$/,
+  // which matches nothing — every period would fall to the floor era and the
+  // worksheet would quietly show 3% ประกันสังคม and no fund.
+  if (!/^\\d{4}-\\d{2}$/.test(p)) return RATE_ERAS[RATE_ERAS.length - 1].rates;
+  for (const era of RATE_ERAS) {
+    if (p >= era.from) return era.rates;
+  }
+  return RATE_ERAS[RATE_ERAS.length - 1].rates;
+}
+function hasWelfareFund(period) { return ratesFor(period).welfareFund > 0; }
+function rateHint(rate) { return Number((rate * 100).toFixed(4)) + "%"; }
+// Mirrors salaryLinkedAmounts in src/payroll-rates.ts — the pot is rounded
+// once and เงินสะสม absorbs the remainder, so the auto-filled cells add up to
+// the same 5% the server seeds. Rounding the two rates separately would put
+// the browser a satang off the sheet it just loaded.
+function salaryLinkedAmounts(salary, rates) {
+  const s = num(salary);
+  const r2 = (x) => Math.round(x * 100) / 100;
+  const welfareFund = r2(s * rates.welfareFund);
+  const pot = r2(s * (rates.savings + rates.welfareFund));
+  return { socialSecurity: r2(s * rates.socialSecurity), savings: r2(pot - welfareFund), welfareFund };
+}
+
+// "กองทุนสงเคราะห์ฯ" columns exist for every cycle so the column count never
+// changes mid-year, but before the fund starts they must not read a
+// misleading "0%". Derived from EWF_START_PERIOD, never spelled out.
+const EWF_START_HINT = (function () {
+  const m = /^(\\d{4})-(\\d{2})$/.exec(EWF_START_PERIOD);
+  if (!m) return EWF_START_PERIOD;
+  const ABBR = ["ม.ค.","ก.พ.","มี.ค.","เม.ย.","พ.ค.","มิ.ย.","ก.ค.","ส.ค.","ก.ย.","ต.ค.","พ.ย.","ธ.ค."];
+  return "เริ่ม " + ABBR[parseInt(m[2], 10) - 1] + " " + (parseInt(m[1], 10) + 543);
+})();
+
+// welfareFund is a DEDUCTION and sits immediately after savings everywhere.
+// rowTakeHome() and rowDeductTotal() both reduce over DEDUCT_FIELDS, so adding
+// it here is what makes it land in รวมรายการหัก and in เงินเดือนสุทธิ; the
+// employer's matching share is deliberately NOT in this list (see
+// rowEmployerMatch).
 const FIELDS = [
   "salary",
-  "socialSecurity","savings","advance","loan","interest","roomCost","leave","otherDeduction",
+  "socialSecurity","savings","welfareFund","advance","loan","interest","roomCost","leave","otherDeduction",
   "commission","breakfast","ot","otherAddition",
 ];
-const DEDUCT_FIELDS = ["socialSecurity","savings","advance","loan","interest","roomCost","leave","otherDeduction"];
+const DEDUCT_FIELDS = ["socialSecurity","savings","welfareFund","advance","loan","interest","roomCost","leave","otherDeduction"];
 const ADD_FIELDS = ["commission","breakfast","ot","otherAddition"];
 const THAI_MONTHS = ["มกราคม","กุมภาพันธ์","มีนาคม","เมษายน","พฤษภาคม","มิถุนายน","กรกฎาคม","สิงหาคม","กันยายน","ตุลาคม","พฤศจิกายน","ธันวาคม"];
 
@@ -657,6 +769,12 @@ function num(v) {
   return Number.isFinite(n) ? n : 0;
 }
 function fmt(n) {
+  // Coerce, don't trust: a queue snapshot (GET /api/queue/:id) is replayed
+  // straight from the stored JSON and never passes through normalize(), so a
+  // request submitted before a column existed reaches here with undefined —
+  // and Math.abs(undefined) is NaN, which slips past the guard below and
+  // throws on .toLocaleString, killing the whole read-only render.
+  n = num(n);
   if (Math.abs(n) < 0.005) return "";
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
@@ -722,6 +840,14 @@ function rowTakeHome(r) {
   return Math.round((num(r.salary) - ded + add) * 100) / 100;
 }
 function rowDeductTotal(r) { return DEDUCT_FIELDS.reduce((s, k) => s + num(r[k]), 0); }
+
+// นายจ้างสมทบ — the employer's matching กองทุนสงเคราะห์ลูกจ้าง contribution.
+// The law fixes both sides at the same rate on the same ค่าจ้าง (ฝ่ายละเท่า ๆ
+// กัน), so it is always exactly the row's welfareFund. It is DERIVED on every
+// read and never stored on the row: storing it would let the two halves drift,
+// and it must never enter DEDUCT_FIELDS — it is new money from the company, so
+// it can never touch รวมรายการหัก or rowTakeHome().
+function rowEmployerMatch(r) { return num(r.welfareFund); }
 
 function displayAccount(r) {
   const num = String(r.accountNumber || "");
@@ -836,6 +962,7 @@ function renderRows(sheet) {
       salaryCell(r, locked) +
       numCell("socialSecurity","deduct") +
       numCell("savings","deduct") +
+      numCell("welfareFund","deduct") +
       numCell("advance","deduct") +
       numCell("loan","deduct") +
       numCell("interest","deduct") +
@@ -843,6 +970,8 @@ function renderRows(sheet) {
       numCell("leave","deduct") +
       numCell("otherDeduction","deduct") +
       \`<td class="calc deduct-total">—</td>\` +
+      // Derived, read-only: no input here on purpose (see rowEmployerMatch).
+      \`<td class="calc employer-match" title="เงินสมทบของนายจ้าง = เท่ากับยอดกองทุนสงเคราะห์ฯ ของลูกจ้าง (คำนวณให้อัตโนมัติ แก้ไขไม่ได้)">—</td>\` +
       numCell("commission","add") +
       numCell("breakfast","add") +
       numCell("ot","add") +
@@ -940,12 +1069,17 @@ function updateScrollBtns() {
   right.disabled = wrap.scrollLeft >= wrap.scrollWidth - wrap.clientWidth - 2;
 }
 
-// Linked-fields rule: ประกันสังคม=5% and เงินสะสม=5% of salary auto-fill
-// only while their current value matches the OLD salary's 5%/5%. Once the
-// user manually overrides, the link breaks and salary changes no longer
-// touch that field.
-// ประกันสังคม 3% → 5% from the 2026-07 cycle. Keep in sync with seededRow in sheets.ts.
-const LINKED_RATES = { socialSecurity: 0.05, savings: 0.05 };
+// Linked-fields rule: ประกันสังคม, เงินสะสม and กองทุนสงเคราะห์ฯ are each a
+// fixed percentage of salary and auto-fill only while their current value
+// still matches the OLD salary times that percentage. Once the user manually
+// overrides (including an intentional 0 they cleared), the link breaks and
+// salary changes no longer touch that field.
+//
+// The percentages are NOT constants — they come from the loaded cycle via
+// ratesFor(currentPeriod), so an open 2026-09 sheet keeps เงินสะสม 5% while
+// 2026-10 onward auto-fills 4.75% + 0.25% กองทุนสงเคราะห์ฯ. Keep this list in
+// step with seededRow in sheets.ts.
+const LINKED_FIELDS = ["socialSecurity", "savings", "welfareFund"];
 
 function setRowField(tr, row, field, value) {
   row[field] = value;
@@ -964,14 +1098,15 @@ function onInput(e) {
       const newSalary = num(e.target.value);
       row.salary = newSalary;
       // Linked rates follow salary ONLY while still untouched — i.e. the field
-      // still equals the OLD salary's 5%/5%. Any manual override (including an
-      // intentional 0 the user cleared) breaks the link and is left alone.
-      for (const k of Object.keys(LINKED_RATES)) {
-        const linkedToOld = Math.round(oldSalary * LINKED_RATES[k] * 100) / 100;
-        if (num(row[k]) === linkedToOld) {
-          const v = Math.round(newSalary * LINKED_RATES[k] * 100) / 100;
-          setRowField(tr, row, k, v);
-        }
+      // still equals the OLD salary times THIS CYCLE's rate. Any manual
+      // override (including an intentional 0 the user cleared) breaks the link
+      // and is left alone. Before the fund starts welfareFund's rate is 0, so
+      // a 0 cell stays 0 and the link is a no-op.
+      const linkedRates = ratesFor(currentPeriod || "");
+      const wasLinked = salaryLinkedAmounts(oldSalary, linkedRates);
+      const nowLinked = salaryLinkedAmounts(newSalary, linkedRates);
+      for (const k of LINKED_FIELDS) {
+        if (num(row[k]) === wasLinked[k]) setRowField(tr, row, k, nowLinked[k]);
       }
     } else {
       row[field] = num(e.target.value);
@@ -1088,6 +1223,10 @@ function onKeyDown(e) {
 
 function recalcRow(tr, r) {
   tr.querySelector(".deduct-total").textContent = fmt(rowDeductTotal(r));
+  // Derived column — re-read from welfareFund on every recalc so the two
+  // halves can never drift apart.
+  const employerCell = tr.querySelector(".employer-match");
+  if (employerCell) employerCell.textContent = fmt(rowEmployerMatch(r));
   tr.querySelector(".takehome").textContent = fmt(rowTakeHome(r));
 }
 
@@ -1121,11 +1260,62 @@ function recalcGrand() {
     \`<td class="sticky-l" data-col="salary">\${fmt(sums.salary)}</td>\`,
     ...DEDUCT_FIELDS.map((f) => \`<td class="deduct">\${fmt(sums[f])}</td>\`),
     \`<td class="calc">\${fmt(sumDeduct)}</td>\`,
+    // Employer's matching share — the column total of a derived column, so it
+    // is the employee-side กองทุนสงเคราะห์ฯ total, NOT part of sumDeduct.
+    \`<td class="calc employer-match">\${fmt(sums.welfareFund)}</td>\`,
     ...ADD_FIELDS.map((f) => \`<td class="add">\${fmt(sums[f])}</td>\`),
     \`<td class="calc">\${fmt(total)}</td>\`,
     \`<td></td>\`,
   ];
   totalsRow.innerHTML = cells.join("");
+  updateEwfRemittance(sums.welfareFund);
+}
+
+// ── กองทุนสงเคราะห์ลูกจ้าง remittance summary ───────────────────────────
+// Due date = the 15th of the month AFTER the cycle (2026-10 wages → 15
+// พฤศจิกายน 2569). Passing a 1-12 month number to Date() lands on the next
+// month and rolls December over into January on its own.
+function ewfDueLabelTH(period) {
+  const m = /^(\\d{4})-(\\d{2})$/.exec(period || "");
+  if (!m) return "";
+  const d = new Date(parseInt(m[1], 10), parseInt(m[2], 10), 15);
+  return \`15 \${THAI_MONTHS[d.getMonth()]} \${d.getFullYear() + 543}\`;
+}
+
+// Employee half, employer half, and the combined figure that actually leaves
+// the bank account. The employer half equals the employee half by law, so it
+// is derived from the same total rather than summed separately. The whole
+// block is hidden for any cycle before EWF_START_PERIOD — there is nothing to
+// remit and a zero panel would only invite someone to "fix" it.
+function updateEwfRemittance(employeeTotal) {
+  const box = document.getElementById("ewfRemit");
+  if (!box) return;
+  const period = currentPeriod || "";
+  if (!hasWelfareFund(period)) { box.hidden = true; return; }
+  const rate = rateHint(ratesFor(period).welfareFund);
+  const employee = num(employeeTotal);
+  const employer = employee;
+  const setText = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+  setText("ewfEmployeeRate", rate);
+  setText("ewfEmployerRate", rate);
+  setText("ewfEmployeeTotal", fmt(employee) || "0.00");
+  setText("ewfEmployerTotal", fmt(employer) || "0.00");
+  setText("ewfCombinedTotal", fmt(employee + employer) || "0.00");
+  setText("ewfDue", "นำส่งภายใน " + ewfDueLabelTH(period));
+  box.hidden = false;
+}
+
+// Column hints follow the LOADED cycle, never a literal: 2026-09 still reads
+// เงินสะสม 5%, and from 2026-10 the same column reads 4.75% with the carved-out
+// 0.25% showing in its own กองทุนสงเคราะห์ฯ column.
+function applyRateHints(period) {
+  const rates = ratesFor(period || "");
+  const setText = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+  setText("hintSocialSecurity", rateHint(rates.socialSecurity));
+  setText("hintSavings", rateHint(rates.savings));
+  const ewfHint = hasWelfareFund(period) ? rateHint(rates.welfareFund) : EWF_START_HINT;
+  setText("hintWelfareFund", ewfHint);
+  setText("hintEmployerMatch", ewfHint);
 }
 
 // Past-month lock state — set per-period in applyPastLockState().
@@ -1219,9 +1409,14 @@ async function loadPeriod(period) {
   currentPeriod = period;
   currentSheet = sheet;
   applyPastLockState(period);
-  // NOTE: we deliberately do NOT backfill ประกันสังคม/เงินสะสม on load. A stored
-  // 0 is an intentional value (the user cleared it), not "needs filling" — the
-  // 5%/5% link is applied live while editing salary (see onInput), never here.
+  // Header percentages are period-gated — re-resolve them for the cycle we
+  // just loaded before anything renders.
+  applyRateHints(period);
+  // NOTE: we deliberately do NOT backfill ประกันสังคม/เงินสะสม/กองทุนสงเคราะห์ฯ
+  // on load. A stored 0 is an intentional value (the user cleared it), not
+  // "needs filling" — the linked-rate fill is applied live while editing
+  // salary (see onInput), never here. This also means reopening an old cycle
+  // never re-rates it at today's percentages.
   let filledAny = false;
   generalNotesEl.value = sheet.generalNotes || "";
   // Default a blank payout date to this period's own payout (5th of the next
@@ -1263,6 +1458,9 @@ for (const p of periods) {
   periodSelect.appendChild(opt);
 }
 periodSelect.value = defaultPeriod();
+// Paint the header percentages for the cycle that is about to load, so the
+// hints are never blank (or stale from the previous cycle) on first render.
+applyRateHints(periodSelect.value);
 periodSelect.addEventListener("change", () => loadPeriod(periodSelect.value).then(() => refreshHistory()));
 
 // History panel: shows count of past transfer-payroll submissions for the
@@ -1367,6 +1565,9 @@ async function loadSnapshot(id) {
 
   currentPeriod = sheet.period || (req.summary.period || periodFromEffective(req.summary.effectiveDate) || "");
   if (currentPeriod) periodSelect.value = currentPeriod;
+  // A snapshot must read with the rates of the cycle it was submitted for,
+  // not today's.
+  applyRateHints(currentPeriod);
   currentSheet = sheet;
   generalNotesEl.value = sheet.generalNotes || "";
   selectedDate = parseGregorian(sheet.effectiveDate);
@@ -1497,7 +1698,7 @@ document.getElementById("restoreAll").addEventListener("click", () => {
     currentSheet.rows.push({
       accountId: a.id, accountNumber: a.accountNumber, accountName: a.accountName,
       bank: "KBANK", nickname: "", position: "",
-      salary: 0, socialSecurity: 0, savings: 0, advance: 0, loan: 0,
+      salary: 0, socialSecurity: 0, savings: 0, welfareFund: 0, advance: 0, loan: 0,
       interest: 0, roomCost: 0, leave: 0, otherDeduction: 0,
       commission: 0, breakfast: 0, ot: 0, otherAddition: 0,
       note: "",
@@ -1514,7 +1715,7 @@ document.getElementById("addRow").addEventListener("click", () => {
   currentSheet.rows.push({
     accountId: id,
     accountNumber: "", accountName: "", bank: "KBANK", nickname: "", position: "",
-    salary: 0, socialSecurity: 0, savings: 0, advance: 0, loan: 0,
+    salary: 0, socialSecurity: 0, savings: 0, welfareFund: 0, advance: 0, loan: 0,
     interest: 0, roomCost: 0, leave: 0, otherDeduction: 0,
     commission: 0, breakfast: 0, ot: 0, otherAddition: 0,
     note: "",
@@ -1711,11 +1912,18 @@ refreshAccountsIndex().then(() => {
 // the editable view and shows #reportRoot only in print media. Auto-
 // triggered by ?print=1 (used from /status's 🖨 links).
 
-const REPORT_DEDUCT_ORDER = ["socialSecurity","savings","advance","loan","interest","roomCost","leave","otherDeduction"];
+const REPORT_DEDUCT_ORDER = ["socialSecurity","savings","welfareFund","advance","loan","interest","roomCost","leave","otherDeduction"];
 const REPORT_ADD_ORDER = ["commission","breakfast","ot","otherAddition"];
+// Base labels, without a rate. The three salary-linked rows carry a
+// percentage that MOVES with the cycle (เงินสะสม 5% → 4.75% from 2026-10,
+// with the 0.25% split out into กองทุนสงเคราะห์ฯ), and the printed report
+// shows those rates in its own <th> row, resolved per-period — so baking a
+// literal in here would be a second copy, free to go stale. ดอกเบี้ย 1.50%
+// and ทำอาหารเช้า 7% are in-house rates that are not period-gated.
 const REPORT_FIELD_LABEL = {
-  socialSecurity: "ประกันสังคม 5%",
-  savings: "เงินสะสม 5%",
+  socialSecurity: "ประกันสังคม",
+  savings: "เงินสะสม",
+  welfareFund: "กองทุนสงเคราะห์ลูกจ้าง",
   advance: "เบิกล่วงหน้า",
   loan: "เงินยืม",
   interest: "ดอกเบี้ย 1.50%",
@@ -1727,7 +1935,6 @@ const REPORT_FIELD_LABEL = {
   ot: "ค่าโอที",
   otherAddition: "รับอื่นๆ",
 };
-
 // Bilingual TH/EN labels for the formal Pay Slip layout. Order mirrors
 // the company's Excel template (สลิปเงินเดือน / Pay Slip).
 const SLIP_EARNINGS = [
@@ -1740,6 +1947,10 @@ const SLIP_EARNINGS = [
 const SLIP_DEDUCTIONS = [
   { key: "socialSecurity", th: "ประกันสังคม",         en: "Social Security" },
   { key: "savings",        th: "เงินสะสมทรัพย์",      en: "Provident Fund" },
+  // Kept distinct from เงินสะสมทรัพย์ above on purpose: from 2026-10 the
+  // employee's 5% splits into 4.75% held in-house and 0.25% remitted to the
+  // government fund. Same total off the payslip, two different custodians.
+  { key: "welfareFund",    th: "กองทุนสงเคราะห์ลูกจ้าง", en: "Employee Welfare Fund" },
   { key: "leave",          th: "ขาด/ลา/มาสาย",       en: "Absence / Leave" },
   { key: "advance",        th: "เบิกล่วงหน้า",        en: "Advance" },
   { key: "loan",           th: "เงินยืม",             en: "Loan" },
@@ -1790,6 +2001,15 @@ async function fetchSheetSafe(period) {
 // Sum of each employee's เงินสะสม deposits from the month after the anchor
 // through this sheet's period (the current sheet is used directly; earlier
 // months are fetched). Keyed by accountId. Empty for periods at/before anchor.
+//
+// DO NOT add welfareFund here, and do not "fix" this later. เงินสะสมคงเหลือ is
+// the balance of the hotel's OWN in-house savings scheme, money we hold on our
+// own books and hand back on resignation. The กองทุนสงเคราะห์ลูกจ้าง 0.25% is
+// remitted to กรมสวัสดิการและคุ้มครองแรงงาน and is held by the government
+// fund, not by us — adding it would overstate what the employee can claim from
+// the company by exactly the amount we no longer have. From 2026-10 the
+// employee's 5% deduction splits 4.75% in-house + 0.25% to the fund, so this
+// balance grows more slowly than before; that is correct, not a bug.
 async function savingsSinceAnchorMap(sheet) {
   const period = sheet.period || currentPeriod || "";
   const map = new Map();
@@ -1827,7 +2047,7 @@ function emptyCells() {
   return '<td class="lbl">&nbsp;</td><td class="amt zero">—</td>';
 }
 
-function buildPaySlip(r, idx, periodLabel, effectiveDate, savingsSinceAnchor, asOf) {
+function buildPaySlip(r, idx, periodLabel, effectiveDate, savingsSinceAnchor, asOf, period) {
   // Pair earnings ↔ deductions into a single 4-column table. When the
   // arrays are uneven, the shorter side gets blank cells.
   const rowCount = Math.max(SLIP_EARNINGS.length, SLIP_DEDUCTIONS.length);
@@ -1845,13 +2065,23 @@ function buildPaySlip(r, idx, periodLabel, effectiveDate, savingsSinceAnchor, as
   // เงินสะสมคงเหลือ = the anchor snapshot PLUS every deposit since the anchor
   // up to and including this cycle (savingsSinceAnchor). So a slip for the cycle
   // about to be paid reflects this month's deposit, not last month's total.
+  //
+  // This is the IN-HOUSE balance only — the กองทุนสงเคราะห์ลูกจ้าง share is
+  // held by the government fund and is deliberately excluded (see
+  // savingsSinceAnchorMap). Once the carve-out is live, the slip says so, so
+  // an employee reading "หัก 5%" against a balance that grew by 4.75% can see
+  // where the difference went.
   const anchorBalance = lookupSavings(r.nickname);
   const savingsBalance = anchorBalance != null
     ? Math.round((anchorBalance + (num(savingsSinceAnchor))) * 100) / 100
     : null;
+  const savingsCarveNote = hasWelfareFund(period)
+    ? '<span class="asof">(เฉพาะเงินสะสมของบริษัท ไม่รวมกองทุนสงเคราะห์ลูกจ้าง)</span>'
+    : "";
   const savingsHtml = savingsBalance != null
     ? \`<div class="slip-savings">
          <span class="label">เงินสะสมคงเหลือ <span class="en">/ Total Savings Balance</span></span>
+         \${savingsCarveNote}
          <span class="amt">\${fmt(savingsBalance)}<span class="baht">บาท / THB</span></span>
          <span class="asof">ณ \${escapeHtml(asOf || SAVINGS_AS_OF)}</span>
        </div>\`
@@ -1958,7 +2188,7 @@ async function buildReport(sheet) {
   const since = await savingsSinceAnchorMap(sheet);
   const asOf = since.size ? (formatLongBE(sheet.effectiveDate) || periodLabel) : SAVINGS_AS_OF;
   const slips = rows.map((r, i) =>
-    buildPaySlip(r, i, periodLabel, sheet.effectiveDate || "", since.get(r.accountId) || 0, asOf)).join("");
+    buildPaySlip(r, i, periodLabel, sheet.effectiveDate || "", since.get(r.accountId) || 0, asOf, period)).join("");
   return slips || \`<div style="padding:20mm;text-align:center;color:#7A7268;font-size:10pt">ยังไม่มีข้อมูลพนักงานสำหรับเดือน\${escapeHtml(periodLabel)}</div>\`;
 }
 
@@ -1993,11 +2223,13 @@ function buildTableReport(sheet) {
   for (const k of allKeys) sums[k] = 0;
   let sumDeduct = 0, sumAdd = 0, sumTake = 0;
 
-  // Per-row cells follow the worksheet's data layout exactly:
+  // Per-row cells follow the worksheet's data layout exactly (23 columns):
   // [idx][name][account][nickname][position][salary]                       ← frozen-left
-  // [socialSecurity][savings][advance][loan][interest][roomCost][leave]    ← deduct
+  // [socialSecurity][savings][welfareFund][advance][loan][interest]        ← deduct
+  // [roomCost][leave]                                                       ← deduct
   // [otherDeduction]                                                        ← deduct (under "หักคอมมิชชั่น" header)
   // [sumDeduct]                                                             ← calc
+  // [employerMatch]                                                         ← calc, DERIVED from welfareFund
   // [commission][breakfast][ot][otherAddition]                              ← add
   // [takeHome]                                                              ← calc
   // [note]
@@ -2016,18 +2248,24 @@ function buildTableReport(sheet) {
       \${tableCell(r.salary, "frozen")}
       \${REPORT_DEDUCT_ORDER.map((k) => tableCell(r[k], "deduct")).join("")}
       \${ded > 0 ? \`<td class="calc">\${fmt(ded)}</td>\` : '<td class="calc zero">—</td>'}
+      \${tableCell(rowEmployerMatch(r), "calc employer-match")}
       \${REPORT_ADD_ORDER.map((k) => tableCell(r[k], "add")).join("")}
       <td class="calc">\${fmt(take)}</td>
       <td class="text" title="\${escapeHtml(r.note || "")}">\${escapeHtml(r.note || "")}</td>
     </tr>\`;
   }).join("");
 
-  // Width allocation across 21 columns on A4 landscape (~277mm usable).
+  // Width allocation across 23 columns on A4 landscape (~277mm usable).
   // Frozen identity cols take ~30%, deductions ~32%, additions ~16%,
   // calc + note ~22%. Tweak here if a column regularly truncates.
+  // The nine deduct columns were trimmed 4.4% → 4.0% each to pay for the two
+  // columns กองทุนสงเคราะห์ฯ added (one deduct + the derived นายจ้างสมทบ)
+  // without squeezing the name/account text columns. table-layout is fixed,
+  // so these are proportions — the browser normalises them.
   const colgroup = \`<colgroup>
     <col style="width:3.2%"><col style="width:11%"><col style="width:7.5%"><col style="width:4.5%"><col style="width:5%"><col style="width:5.3%">
-    <col style="width:4.4%"><col style="width:4.4%"><col style="width:4.4%"><col style="width:4.4%"><col style="width:4.4%"><col style="width:4.4%"><col style="width:4.4%"><col style="width:4.4%">
+    <col style="width:4%"><col style="width:4%"><col style="width:4%"><col style="width:4%"><col style="width:4%"><col style="width:4%"><col style="width:4%"><col style="width:4%"><col style="width:4%">
+    <col style="width:4.7%">
     <col style="width:4.7%">
     <col style="width:4.4%"><col style="width:4.4%"><col style="width:4.4%"><col style="width:4.4%">
     <col style="width:5.5%">
@@ -2039,8 +2277,21 @@ function buildTableReport(sheet) {
     : "";
 
   // Three-row header mirroring the worksheet exactly: top-level groups
-  // "รายการหัก" (8 cols) and "รับอื่นๆ" (2 cols) span their sub-cells;
-  // "อื่นๆ" inside the deduct group further splits into 4 leaf cells.
+  // "รายการหัก" (9 cols — 8 plus กองทุนสงเคราะห์ฯ) and "รับอื่นๆ" (2 cols)
+  // span their sub-cells; "อื่นๆ" inside the deduct group further splits into
+  // 4 leaf cells. Keep this colspan arithmetic in step with the editable
+  // table's header and with REPORT_DEDUCT_ORDER — a mismatch silently shifts
+  // every column after it.
+  const rates = ratesFor(period);
+  const ewfHint = hasWelfareFund(period) ? rateHint(rates.welfareFund) : EWF_START_HINT;
+  // The printed table is what gets filed with the remittance, so it carries
+  // the same combined figure and deadline as the on-screen footer. Nothing is
+  // printed for cycles the fund does not apply to.
+  const ewfSummaryHtml = hasWelfareFund(period)
+    ? \`<span><strong>กองทุนสงเคราะห์ฯ</strong>ลูกจ้าง \${fmt(sums.welfareFund) || "0.00"} + \` +
+      \`นายจ้าง \${fmt(sums.welfareFund) || "0.00"} = \${fmt(sums.welfareFund * 2) || "0.00"} บาท · \` +
+      \`นำส่งภายใน \${ewfDueLabelTH(period)}</span>\`
+    : "";
   return \`
     <div class="report-header">
       <h1>\${title}</h1>
@@ -2056,8 +2307,9 @@ function buildTableReport(sheet) {
           <th rowspan="3" class="frozen">ชื่อเล่น</th>
           <th rowspan="3" class="frozen">ตำแหน่ง</th>
           <th rowspan="3" class="frozen">เงินเดือน</th>
-          <th colspan="8" class="deduct">รายการหัก</th>
+          <th colspan="9" class="deduct">รายการหัก</th>
           <th rowspan="3" class="calc">รวม<br>รายการหัก</th>
+          <th rowspan="3" class="calc employer-match">นายจ้าง<br>สมทบ<span class="hint">\${ewfHint}</span></th>
           <th colspan="2" class="add">รับอื่นๆ</th>
           <th rowspan="3" class="add">ค่าโอที</th>
           <th rowspan="3" class="add">รวมรับอื่นๆ</th>
@@ -2065,8 +2317,9 @@ function buildTableReport(sheet) {
           <th rowspan="3">หมายเหตุ</th>
         </tr>
         <tr>
-          <th rowspan="2" class="deduct">ประกันสังคม<span class="hint">5%</span></th>
-          <th rowspan="2" class="deduct">เงินสะสม<span class="hint">5%</span></th>
+          <th rowspan="2" class="deduct">ประกันสังคม<span class="hint">\${rateHint(rates.socialSecurity)}</span></th>
+          <th rowspan="2" class="deduct">เงินสะสม<span class="hint">\${rateHint(rates.savings)}</span></th>
+          <th rowspan="2" class="deduct">กองทุน<br>สงเคราะห์ฯ<span class="hint">\${ewfHint}</span></th>
           <th rowspan="2" class="deduct">เบิก<br>ล่วงหน้า</th>
           <th colspan="4" class="deduct">อื่นๆ</th>
           <th rowspan="2" class="deduct">หัก<br>คอมมิชชั่น</th>
@@ -2087,6 +2340,7 @@ function buildTableReport(sheet) {
           <td class="frozen">\${fmt(sums.salary)}</td>
           \${REPORT_DEDUCT_ORDER.map((k) => \`<td class="deduct">\${sums[k] > 0 ? fmt(sums[k]) : '<span class="zero">—</span>'}</td>\`).join("")}
           <td class="calc">\${fmt(sumDeduct)}</td>
+          <td class="calc employer-match">\${sums.welfareFund > 0 ? fmt(sums.welfareFund) : '<span class="zero">—</span>'}</td>
           \${REPORT_ADD_ORDER.map((k) => \`<td class="add">\${sums[k] > 0 ? fmt(sums[k]) : '<span class="zero">—</span>'}</td>\`).join("")}
           <td class="calc">\${fmt(sumTake)}</td>
           <td></td>
@@ -2095,6 +2349,7 @@ function buildTableReport(sheet) {
     </table>
     <div class="table-summary">
       <span><strong>จำนวนผู้รับโอน</strong>\${recipientCount} คน</span>
+      \${ewfSummaryHtml}
       <span class="grand">รวมยอดโอน \${fmt(totalAll)}</span>
     </div>
     \${generalNotesHtml}

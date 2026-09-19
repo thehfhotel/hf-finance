@@ -74,6 +74,10 @@ const handTypedRow = {
   salary: 12000,
   socialSecurity: 600,
   savings: 600,
+  // Held at 0 on purpose: this fixture stands in for the cycles that are open
+  // now, which are all before EWF_START_PERIOD, so every assertion about it
+  // stays where it was before the welfare fund existed.
+  welfareFund: 0,
   advance: 0,
   loan: 0,
   interest: 0,
@@ -101,7 +105,7 @@ for (const period of [OPEN_PERIOD, PAST_PERIOD]) {
   );
 }
 
-const { loadSheet, isPastPeriod } = await import("../src/sheets");
+const { loadSheet, isPastPeriod, takeHome } = await import("../src/sheets");
 const { listAccounts } = await import("../src/store");
 
 describe("isPastPeriod", () => {
@@ -222,5 +226,110 @@ describe("loadSheet reconciliation", () => {
     );
     const sheet = await loadSheet(period);
     expect(sheet.rows.map((r) => r.accountId)).not.toContain("21");
+  });
+});
+
+// A row with every money column zeroed, so each test below sets exactly the
+// fields it is about and nothing else can drift into the arithmetic. Shaped
+// off handTypedRow rather than importing SheetRow, because src/sheets is only
+// reachable through the dynamic import above (DATA_PATH has to be set first).
+type Row = typeof handTypedRow;
+
+function zeroRow(over: Partial<Row> = {}): Row {
+  return {
+    ...structuredClone(handTypedRow),
+    accountId: "m-takehome-0001",
+    accountName: "ทดสอบ ยอดโอน",
+    note: "",
+    salary: 0,
+    socialSecurity: 0,
+    savings: 0,
+    welfareFund: 0,
+    ...over,
+  };
+}
+
+describe("takeHome", () => {
+  it("subtracts กองทุนสงเคราะห์ลูกจ้าง like any other deduction", () => {
+    // Only welfareFund is non-zero, so the row proves the field is actually
+    // wired into the sum — a column that is displayed but never subtracted
+    // pays the employee 0.25% too much and still looks right on screen.
+    expect(takeHome(zeroRow({ salary: 10000, welfareFund: 25 }))).toBe(9975);
+  });
+
+  it("leaves take-home unchanged by the carve-out", () => {
+    // The owner's whole reason for carving the EWF out of เงินสะสม instead of
+    // adding it on top: 5% becomes 4.75% + 0.25%, and the employee's net does
+    // not move. Same salary, same net, either side of 2026-10.
+    const before = zeroRow({ salary: 12000, socialSecurity: 600, savings: 600, welfareFund: 0 });
+    const after = zeroRow({ salary: 12000, socialSecurity: 600, savings: 570, welfareFund: 30 });
+    expect(takeHome(before)).toBe(10800);
+    expect(takeHome(after)).toBe(10800);
+  });
+
+  it("never charges the employee the employer's matching เงินสมทบ", () => {
+    // The employer owes 0.25% on top, but it is employer cost — new money the
+    // hotel remits, never withheld. If the derived employer figure ever leaks
+    // into the row's deductions the net drops by a second 0.25% (฿10770 here),
+    // which is the one way this change can quietly underpay someone.
+    const row = zeroRow({ salary: 12000, socialSecurity: 600, savings: 570, welfareFund: 30 });
+    const deductions = row.socialSecurity + row.savings + row.welfareFund;
+    expect(takeHome(row)).toBe(row.salary - deductions);
+    expect(takeHome(row)).not.toBe(row.salary - deductions - row.welfareFund);
+  });
+
+  it("still counts the additions alongside the new deduction", () => {
+    const row = zeroRow({ salary: 12000, socialSecurity: 600, savings: 570, welfareFund: 30, ot: 500, breakfast: 100 });
+    expect(takeHome(row)).toBe(11400);
+  });
+});
+
+describe("loadSheet — sheets written before welfareFund existed", () => {
+  it("reads a missing welfareFund as 0 rather than NaN", async () => {
+    // The regression this guards: data/sheets/*.json already on disk have no
+    // welfareFund key at all, so the row arrives with `undefined`, every sum
+    // touching it becomes NaN, and the worksheet renders NaN in the ยอดโอน
+    // column for a cycle nobody edited. normalize() is not exported, so this
+    // goes through loadSheet(), which is what actually runs it in production.
+    const period = "2031-08";
+    const legacyRow = {
+      accountId: "m-legacy-0002",
+      accountNumber: "555-1-23456-7", // not on the roster, so it stays its own row
+      accountName: "ทดสอบ แถวเก่า",
+      bank: "KBANK",
+      nickname: "",
+      position: "",
+      salary: 10000,
+      socialSecurity: 500,
+      savings: 500,
+      // welfareFund deliberately absent — this is the old on-disk shape.
+      advance: 0,
+      loan: 0,
+      interest: 0,
+      roomCost: 0,
+      leave: 0,
+      otherDeduction: 0,
+      commission: 0,
+      breakfast: 0,
+      ot: 0,
+      otherAddition: 0,
+      note: "",
+    } as unknown as Row;
+    writeFileSync(
+      join(dir, "sheets", `${period}.json`),
+      JSON.stringify({
+        period,
+        effectiveDate: "",
+        rows: [legacyRow],
+        generalNotes: "",
+        dismissed: [],
+        updatedAt: "2026-08-04T00:00:00.000Z",
+      })
+    );
+
+    const sheet = await loadSheet(period);
+    const row = sheet.rows.find((r) => r.accountId === "m-legacy-0002");
+    expect(row?.welfareFund).toBe(0);
+    expect(takeHome(row!)).toBe(9000);
   });
 });
